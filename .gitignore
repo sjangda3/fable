@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.vite/
+out/
+.fable-dev/
+coverage/
+artifacts/
+.playwright-mcp/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+supabase/.temp/
+supabase/.branches/

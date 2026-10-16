@@ -1,0 +1,52 @@
+name: Check and package
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+          - os: windows-2025
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run make -- --arch=${{ matrix.arch }}
+      - run: npm run smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fable-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/make/**
+          if-no-files-found: error
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: local_test_only
+          POSTGRES_DB: fable_test
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      PGPASSWORD: local_test_only
+    steps:
+      - uses: actions/checkout@v4
+      - run: psql -h localhost -U postgres -d fable_test -v ON_ERROR_STOP=1 -f tests/integration/backend-bootstrap.sql -f supabase/migrations/20261016031356_initial_encrypted_sync.sql -f tests/integration/backend-access.sql
