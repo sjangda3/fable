@@ -19,19 +19,105 @@ import {
   history,
   historyKeymap,
   indentWithTab,
+  undo,
+  redo,
+  indentMore,
+  indentLess,
 } from "@codemirror/commands";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import {
   syntaxHighlighting,
   HighlightStyle,
   syntaxTree,
 } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
-import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
+import {
+  searchKeymap,
+  highlightSelectionMatches,
+  openSearchPanel,
+} from "@codemirror/search";
 import { api } from "./api.ts";
 import type { DocumentSnapshot } from "../../../packages/contracts/index.ts";
 import { imageURL } from "./links.ts";
 import { external, protectFrontmatter } from "./editor-state.ts";
+import {
+  blockInsertion,
+  editorFormatting,
+  formattingTransaction,
+  type EditorCommand,
+  type EditorFormatting,
+} from "./editor-commands.ts";
+import { documentDropType, FormatButton } from "./DocumentChrome.tsx";
+
+class MarkerWidget extends WidgetType {
+  constructor(
+    private text: string,
+    private className: string,
+  ) {
+    super();
+  }
+  eq(other: MarkerWidget) {
+    return this.text === other.text && this.className === other.className;
+  }
+  toDOM() {
+    const span = document.createElement("span");
+    span.className = this.className;
+    span.textContent = this.text;
+    return span;
+  }
+}
+class TableWidget extends WidgetType {
+  constructor(
+    private raw: string,
+    private at: number,
+  ) {
+    super();
+  }
+  eq(other: TableWidget) {
+    return this.raw === other.raw && this.at === other.at;
+  }
+  toDOM(view: EditorView) {
+    const root = document.createElement("div");
+    root.className = "cm-table-preview";
+    const table = document.createElement("table");
+    const rows = this.raw
+      .trim()
+      .split("\n")
+      .map((line) =>
+        line
+          .trim()
+          .replace(/^\||\|$/g, "")
+          .split(/(?<!\\)\|/)
+          .map((cell) => cell.trim()),
+      );
+    const head = document.createElement("thead"),
+      body = document.createElement("tbody");
+    rows.forEach((cells, i) => {
+      if (i === 1) return;
+      const tr = document.createElement("tr");
+      cells.forEach((cell) => {
+        const td = document.createElement(i === 0 ? "th" : "td");
+        td.textContent = cell;
+        tr.append(td);
+      });
+      (i === 0 ? head : body).append(tr);
+    });
+    table.append(head, body);
+    root.append(table);
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.textContent = "Edit table";
+    edit.onclick = () => {
+      view.dispatch({ selection: { anchor: this.at } });
+      view.focus();
+    };
+    root.append(edit);
+    return root;
+  }
+  ignoreEvent() {
+    return true;
+  }
+}
 
 class LinkWidget extends WidgetType {
   constructor(
@@ -118,9 +204,51 @@ function decorations(state: EditorState, sourcePath: string) {
   if (fm)
     ranges.push(Decoration.replace({ block: true }).range(0, fm[0].length));
   const offset = fm?.[0].length ?? 0;
+  const tables: { from: number; to: number }[] = [];
+  syntaxTree(state).iterate({
+    enter(node) {
+      if (node.name === "Table" && (cursor < node.from || cursor > node.to)) {
+        tables.push({ from: node.from, to: node.to });
+        ranges.push(
+          Decoration.replace({
+            block: true,
+            widget: new TableWidget(
+              state.sliceDoc(node.from, node.to),
+              node.from,
+            ),
+          }).range(node.from, node.to),
+        );
+      }
+    },
+  });
   for (let number = 1; number <= state.doc.lines; number++) {
     const line = state.doc.line(number);
     if (line.from < offset) continue;
+    if (
+      !line.text &&
+      number > 1 &&
+      /^#{2,6}\s/.test(state.doc.line(number - 1).text)
+    )
+      ranges.push(
+        Decoration.line({ class: "cm-heading-gap" }).range(line.from),
+      );
+    if (tables.some((table) => line.from >= table.from && line.from < table.to))
+      continue;
+    let code = false;
+    for (
+      let node = syntaxTree(state).resolveInner(line.from, 1);
+      node;
+      node = node.parent!
+    )
+      if (["FencedCode", "CodeBlock"].includes(node.name)) code = true;
+    if (code) {
+      ranges.push(Decoration.line({ class: "cm-code-line" }).range(line.from));
+      if (/^\s*(```|~~~)/.test(line.text))
+        ranges.push(
+          Decoration.line({ class: "cm-code-fence" }).range(line.from),
+        );
+      continue;
+    }
     const heading = /^(#{1,6})\s+/.exec(line.text);
     if (heading) {
       ranges.push(
@@ -128,13 +256,26 @@ function decorations(state: EditorState, sourcePath: string) {
           class: `cm-heading cm-heading-${heading[1].length}`,
         }).range(line.from),
       );
-      if (cursor < line.from || cursor > line.to)
-        ranges.push(
-          Decoration.replace({}).range(
-            line.from,
-            line.from + heading[0].length,
-          ),
-        );
+      ranges.push(
+        Decoration.replace({}).range(line.from, line.from + heading[0].length),
+      );
+    }
+    const rule = /^\s*(?:-{3,}|\*{3,}|_{3,}|- - -(?: -)*)\s*$/.test(line.text);
+    if (rule) {
+      const style = line.text.includes("*")
+        ? "dotted"
+        : line.text.includes(" ")
+          ? "dashed"
+          : line.text.includes("_")
+            ? "thick"
+            : "thin";
+      ranges.push(Decoration.line({ class: "cm-rule-line" }).range(line.from));
+      ranges.push(
+        Decoration.replace({
+          widget: new MarkerWidget("", `cm-divider line-${style}`),
+        }).range(line.from, line.to),
+      );
+      continue;
     }
     const task = /^(\s*(?:[-+*]|\d+[.)])\s+)\[([ xX])\]\s?/.exec(line.text);
     if (task)
@@ -146,6 +287,26 @@ function decorations(state: EditorState, sourcePath: string) {
           ),
         }).range(line.from, line.from + task[0].length),
       );
+    const list = /^(\s*)([-+*]|\d+[.)])\s+/.exec(line.text);
+    if (list) {
+      ranges.push(Decoration.line({ class: "cm-list-line" }).range(line.from));
+      if (!task)
+        ranges.push(
+          Decoration.replace({
+            widget: new MarkerWidget(
+              /^\d/.test(list[2]) ? list[2] : "•",
+              "cm-list-marker",
+            ),
+          }).range(line.from + list[1].length, line.from + list[0].length),
+        );
+    }
+    const quote = /^>\s?/.exec(line.text);
+    if (quote) {
+      ranges.push(Decoration.line({ class: "cm-quote-line" }).range(line.from));
+      ranges.push(
+        Decoration.replace({}).range(line.from, line.from + quote[0].length),
+      );
+    }
     const annotation = /\s*<!--\s*fable:task\s+\{.*?\}\s*-->/.exec(line.text);
     if (annotation)
       ranges.push(
@@ -184,11 +345,12 @@ function decorations(state: EditorState, sourcePath: string) {
   syntaxTree(state).iterate({
     enter(node) {
       if (node.from < offset) return;
-      if (["EmphasisMark", "CodeMark"].includes(node.name)) {
-        const line = state.doc.lineAt(node.from);
-        if (cursor < line.from || cursor > line.to)
-          ranges.push(Decoration.replace({}).range(node.from, node.to));
-      }
+      if (
+        tables.some((table) => node.from >= table.from && node.from < table.to)
+      )
+        return;
+      if (["EmphasisMark", "CodeMark", "StrikethroughMark"].includes(node.name))
+        ranges.push(Decoration.replace({}).range(node.from, node.to));
     },
   });
   ranges.sort((a, b) => a.from - b.from || a.startSide - b.startSide);
@@ -222,6 +384,8 @@ export interface EditorHandle {
   focusTask(line: number): void;
   insert(text: string): void;
   acceptPreservedDraft(): void;
+  command(command: EditorCommand): void;
+  insertBlock(text: string): void;
 }
 export const MarkdownEditor = forwardRef<
   EditorHandle,
@@ -232,10 +396,19 @@ export const MarkdownEditor = forwardRef<
     onStatus: (status: string) => void;
     onError: (message: string) => void;
     onConflictCopy: (raw: string) => void;
+    onFormattingChange?: (formatting: EditorFormatting) => void;
   }
 >(
   (
-    { document: doc, missing, source, onStatus, onError, onConflictCopy },
+    {
+      document: doc,
+      missing,
+      source,
+      onStatus,
+      onError,
+      onConflictCopy,
+      onFormattingChange,
+    },
     ref,
   ) => {
     const host = useRef<HTMLDivElement>(null),
@@ -250,6 +423,79 @@ export const MarkdownEditor = forwardRef<
       timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined),
       conflicted = useRef(false);
     const [conflict, setConflict] = useState(false);
+    const [bubble, setBubble] = useState<{
+      left: number;
+      top: number;
+      below: boolean;
+      format: EditorFormatting;
+    } | null>(null);
+    const sourceRef = useRef(source);
+    sourceRef.current = source;
+    const formattingCallback = useRef(onFormattingChange);
+    const selectionFrame = useRef<number | undefined>(undefined);
+    formattingCallback.current = onFormattingChange;
+    const reportSelection = (v: EditorView) => {
+      if (selectionFrame.current !== undefined)
+        cancelAnimationFrame(selectionFrame.current);
+      const format = editorFormatting(v.state);
+      formattingCallback.current?.(format);
+      const range = v.state.selection.main;
+      if (range.empty || sourceRef.current) {
+        setBubble(null);
+        return;
+      }
+      selectionFrame.current = requestAnimationFrame(() => {
+        if (view.current !== v) return;
+        const start = v.coordsAtPos(range.from),
+          end = v.coordsAtPos(range.to);
+        const canvas = host.current
+          ?.closest(".document-canvas")
+          ?.getBoundingClientRect();
+        if (
+          !start ||
+          !end ||
+          !canvas ||
+          end.bottom < canvas.top ||
+          start.top > canvas.bottom
+        ) {
+          setBubble(null);
+          return;
+        }
+        const below = start.top < canvas.top + 48;
+        setBubble({
+          left: Math.max(
+            canvas.left + 160,
+            Math.min(canvas.right - 160, (start.left + end.right) / 2),
+          ),
+          top: below
+            ? Math.min(
+                canvas.bottom - 48,
+                Math.max(canvas.top + 8, end.bottom + 8),
+              )
+            : start.top - 8,
+          below,
+          format,
+        });
+      });
+    };
+    const run = (command: EditorCommand) => {
+      const v = view.current;
+      if (!v) return;
+      if (command === "undo") undo(v);
+      else if (command === "redo") redo(v);
+      else if (command === "indent") indentMore(v);
+      else if (command === "outdent") indentLess(v);
+      else if (command === "search") {
+        setBubble(null);
+        openSearchPanel(v);
+        return;
+      } else {
+        const transaction = formattingTransaction(v.state, command);
+        if (transaction) v.dispatch({ ...transaction, scrollIntoView: true });
+      }
+      v.focus();
+      reportSelection(v);
+    };
     const callbacks = useRef({ onStatus, onError });
     callbacks.current = { onStatus, onError };
     const persist = async (): Promise<boolean> => {
@@ -300,6 +546,14 @@ export const MarkdownEditor = forwardRef<
         conflicted.current = false;
         setConflict(false);
       },
+      command: run,
+      insertBlock(text) {
+        const v = view.current;
+        if (v) {
+          v.dispatch(blockInsertion(v.state, text));
+          v.focus();
+        }
+      },
       focusTask(line) {
         const v = view.current;
         if (v) {
@@ -334,11 +588,25 @@ export const MarkdownEditor = forwardRef<
             ),
             history(),
             drawSelection(),
-            markdown(),
+            markdown({ base: markdownLanguage }),
             syntaxHighlighting(highlight),
             highlightSelectionMatches(),
             EditorView.lineWrapping,
             keymap.of([
+              {
+                key: "Mod-b",
+                run: () => {
+                  run("bold");
+                  return true;
+                },
+              },
+              {
+                key: "Mod-i",
+                run: () => {
+                  run("italic");
+                  return true;
+                },
+              },
               ...defaultKeymap,
               ...historyKeymap,
               ...searchKeymap,
@@ -352,6 +620,8 @@ export const MarkdownEditor = forwardRef<
               source ? [] : [livePreview(doc.path), protectFrontmatter],
             ),
             EditorView.updateListener.of((update) => {
+              if (update.selectionSet || update.docChanged)
+                reportSelection(update.view);
               if (
                 update.docChanged &&
                 !update.transactions.some((t) => t.annotation(external))
@@ -370,6 +640,29 @@ export const MarkdownEditor = forwardRef<
               },
             }),
             EditorView.domEventHandlers({
+              drop: (event, v) => {
+                const text = event.dataTransfer?.getData(documentDropType);
+                if (!text) return false;
+                event.preventDefault();
+                v.dispatch(
+                  blockInsertion(
+                    v.state,
+                    text,
+                    v.posAtCoords({ x: event.clientX, y: event.clientY }) ??
+                      undefined,
+                  ),
+                );
+                v.focus();
+                return true;
+              },
+              dragover: (event) => {
+                if (event.dataTransfer?.types.includes(documentDropType)) {
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "copy";
+                  return true;
+                }
+                return false;
+              },
               blur: () => {
                 void persistRef.current();
               },
@@ -378,6 +671,30 @@ export const MarkdownEditor = forwardRef<
         }),
       });
       view.current = editor;
+      reportSelection(editor);
+      const hideBubble = () => setBubble(null);
+      const dismissOutside = (event: Event) => {
+        const target = event.target;
+        if (
+          target instanceof Element &&
+          (host.current?.contains(target) ||
+            target.closest(".selection-toolbar"))
+        )
+          return;
+        hideBubble();
+      };
+      window.document.addEventListener("pointerdown", dismissOutside);
+      const canvas = host.current?.closest(".document-canvas");
+      const repositionBubble = () => {
+        if (
+          editor.hasFocus ||
+          window.document.activeElement?.closest(".selection-toolbar")
+        )
+          reportSelection(editor);
+        else hideBubble();
+      };
+      canvas?.addEventListener("scroll", repositionBubble, { passive: true });
+      window.addEventListener("resize", repositionBubble);
       const interval = setInterval(() => {
         if (latest.current !== saved.current) void persistRef.current();
       }, 1500);
@@ -392,12 +709,18 @@ export const MarkdownEditor = forwardRef<
       return () => {
         clearInterval(interval);
         clearTimeout(timer.current);
+        if (selectionFrame.current !== undefined)
+          cancelAnimationFrame(selectionFrame.current);
         window.removeEventListener("beforeunload", prevent);
+        canvas?.removeEventListener("scroll", repositionBubble);
+        window.removeEventListener("resize", repositionBubble);
+        window.document.removeEventListener("pointerdown", dismissOutside);
         editor.destroy();
         view.current = null;
       };
     }, []);
     useEffect(() => {
+      setBubble(null);
       view.current?.dispatch({
         effects: compartment.current.reconfigure(
           source ? [] : [livePreview(doc.path), protectFrontmatter],
@@ -478,6 +801,60 @@ export const MarkdownEditor = forwardRef<
           className={`markdown-editor ${source ? "source-mode" : ""}`}
           ref={host}
         />
+        {bubble && (
+          <div
+            className={`selection-toolbar ${bubble.below ? "is-below" : ""}`}
+            role="toolbar"
+            aria-label="Selection formatting"
+            style={{ left: bubble.left, top: bubble.top }}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <select
+              className="selection-style"
+              aria-label="Selection text style"
+              value={bubble.format.block}
+              onMouseDown={(event) => event.stopPropagation()}
+              onChange={(event) => run(event.target.value as EditorCommand)}
+            >
+              <option value="paragraph">Text</option>
+              <option value="heading1">Title</option>
+              <option value="heading2">H1</option>
+              <option value="heading3">H2</option>
+            </select>
+            <FormatButton
+              command="bold"
+              label="Bold selection"
+              active={bubble.format.bold}
+              run={run}
+            />
+            <FormatButton
+              command="italic"
+              label="Italic selection"
+              active={bubble.format.italic}
+              run={run}
+            />
+            <FormatButton
+              command="strike"
+              label="Strikethrough selection"
+              active={bubble.format.strike}
+              run={run}
+            />
+            <span className="selection-toolbar-divider" />
+            <FormatButton
+              command="code"
+              label="Code selection"
+              active={bubble.format.code}
+              run={run}
+            />
+            <FormatButton command="link" label="Link selection" run={run} />
+            <FormatButton command="quote" label="Quote selection" run={run} />
+            <FormatButton
+              command="taskList"
+              label="Make selection a task"
+              run={run}
+            />
+          </div>
+        )}
       </>
     );
   },

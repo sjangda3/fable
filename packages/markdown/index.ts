@@ -14,6 +14,24 @@ import {
 } from "../contracts/index.ts";
 
 const parser = unified().use(remarkParse).use(remarkGfm);
+/** Replace the real document title without touching headings inside code or YAML. */
+export function setDocumentTitle(raw: string, title: string) {
+  const offset = frontmatter(raw)?.length ?? 0;
+  const body = raw.slice(offset);
+  const tree = parser.parse(body);
+  const heading = tree.children.find(
+    (node) => node.type === "heading" && node.depth === 1,
+  );
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  const text = `# ${title.replace(/[\\`*_{}\[\]<>#&~]/g, "\\$&")}`;
+  if (heading?.position)
+    return (
+      raw.slice(0, offset + heading.position.start.offset!) +
+      text +
+      raw.slice(offset + heading.position.end.offset!)
+    );
+  return raw.slice(0, offset) + text + eol + eol + body;
+}
 export const revisionOf = (raw: string | Uint8Array) =>
   createHash("sha256").update(raw).digest("hex");
 export function frontmatter(raw: string) {
@@ -206,6 +224,11 @@ export function parseMarkdown(
           depth,
           context,
           due: typeof meta.due === "string" ? meta.due : undefined,
+          projectId:
+            meta.project === null ||
+            (typeof meta.project === "string" && meta.project.length)
+              ? meta.project
+              : undefined,
           status: node.checked
             ? "done"
             : ["todo", "waiting", "ready", "doing"].includes(meta.status)
@@ -332,6 +355,13 @@ export function toggleTask(
   taskId: string,
   done: boolean,
 ) {
+  return updateTask(document, taskId, { status: done ? "done" : "todo" });
+}
+export function updateTask(
+  document: DocumentSnapshot,
+  taskId: string,
+  values: { status?: TaskRef["status"]; projectId?: string | null },
+) {
   const task = document.tasks.find((t) => t.id === taskId);
   if (!task)
     throw new FableError(
@@ -344,12 +374,19 @@ export function toggleTask(
   );
   const meta = annotation ? JSON.parse(annotation[1]) : { id: randomUUID() };
   if (meta.id !== task.id) meta.id = randomUUID();
-  meta.status = done ? "done" : "todo";
-  if (done) meta.completed_at = new Date().toISOString();
-  else delete meta.completed_at;
-  const edits: TextEdit[] = [
-    { from: task.checkFrom, to: task.checkTo, insert: done ? "x" : " " },
-  ];
+  const edits: TextEdit[] = [];
+  if (values.status !== undefined) {
+    meta.status = values.status;
+    const done = values.status === "done";
+    if (done) meta.completed_at ??= new Date().toISOString();
+    else delete meta.completed_at;
+    edits.push({
+      from: task.checkFrom,
+      to: task.checkTo,
+      insert: done ? "x" : " ",
+    });
+  }
+  if (values.projectId !== undefined) meta.project = values.projectId;
   if (annotation)
     edits.push({
       from: task.from + annotation.index,

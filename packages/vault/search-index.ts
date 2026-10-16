@@ -14,9 +14,9 @@ export class SearchIndex {
       "CREATE TABLE IF NOT EXISTS snapshots (path TEXT PRIMARY KEY, revision TEXT NOT NULL, snapshot TEXT NOT NULL)",
     );
     // Bump when parser semantics change. Cached task references are never authoritative.
-    if (this.db.pragma("user_version", { simple: true }) !== 1) {
+    if (this.db.pragma("user_version", { simple: true }) !== 2) {
       this.db.exec(
-        "DELETE FROM documents; DELETE FROM snapshots; PRAGMA user_version=1",
+        "DELETE FROM documents; DELETE FROM snapshots; PRAGMA user_version=2",
       );
     }
   }

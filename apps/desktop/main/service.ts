@@ -10,7 +10,9 @@ import { SyncEngine, type SecretStore } from "../../../packages/sync/index.ts";
 import {
   changeSetSchema,
   sidebarReorderSchema,
+  projectSettingsSchema,
   kinds,
+  statuses,
   type AppEvent,
   type Operation,
   type Operations,
@@ -258,6 +260,16 @@ export class AppService extends EventEmitter {
           .parse(input);
         return this.vault.createFolder(a.parentId, a.name, a.directory);
       }
+      case "folders.delete": {
+        const a = z
+          .object({
+            parentId: idSchema,
+            directory: z.string().min(1).max(1000),
+            baseRevision: z.string().length(64),
+          })
+          .parse(input);
+        return this.vault.deleteFolder(a.parentId, a.directory, a.baseRevision);
+      }
       case "documents.preserveDraft": {
         const a = z
           .object({
@@ -272,6 +284,16 @@ export class AppService extends EventEmitter {
           .extend({ raw: z.string().max(10 * 1024 * 1024) })
           .parse(input);
         return this.vault.save(a.id, a.baseRevision, a.raw);
+      }
+      case "projects.update": {
+        const a = base.extend(projectSettingsSchema.shape).parse(input);
+        return this.vault.updateProject(a.id, a.baseRevision, a);
+      }
+      case "projects.create": {
+        const a = projectSettingsSchema
+          .extend({ parent: idSchema })
+          .parse(input);
+        return this.vault.createProject(a.parent, a);
       }
       case "documents.metadata": {
         const a = base
@@ -302,19 +324,21 @@ export class AppService extends EventEmitter {
       }
       case "documents.trash": {
         const a = base.parse(input);
-        return this.vault.apply({
-          id: randomUUID(),
-          summary: `Move ${this.vault.document(a.id).title} to history`,
-          changes: [
-            { type: "trash", documentId: a.id, baseRevision: a.baseRevision },
-          ],
-        });
+        return this.vault.deleteDocument(a.id, a.baseRevision);
       }
       case "documents.reveal": {
-        const a = z.object({ id: idSchema.optional() }).parse(input);
+        const a = z
+          .object({
+            id: idSchema.optional(),
+            path: z.string().min(1).max(1000).optional(),
+          })
+          .refine((value) => !(value.id && value.path))
+          .parse(input);
         const file = a.id
           ? await this.vault.safePath(this.vault.document(a.id).path)
-          : this.vault.root;
+          : a.path
+            ? await this.vault.safePath(a.path)
+            : this.vault.root;
         await this.hooks?.reveal(file);
         return;
       }
@@ -329,7 +353,7 @@ export class AppService extends EventEmitter {
           })
           .parse(input ?? {});
         const attachment =
-          a.data && a.name
+          a.data !== undefined && a.name !== undefined
             ? { name: a.name, bytes: Buffer.from(a.data, "base64") }
             : await this.hooks?.chooseAttachment();
         if (!attachment) return null;
@@ -372,9 +396,27 @@ export class AppService extends EventEmitter {
           .object({
             title: z.string().trim().min(1).max(2000),
             documentId: idSchema.optional(),
+            areaId: idSchema.optional(),
+            status: z.enum(statuses).optional(),
           })
           .parse(input);
-        return this.vault.addTask(a.title, a.documentId);
+        return this.vault.addTask(a.title, a.documentId, a);
+      }
+      case "tasks.update": {
+        const a = z
+          .object({
+            documentId: idSchema,
+            taskId: idSchema,
+            baseRevision: z.string().length(64),
+            status: z.enum(statuses).optional(),
+            projectId: idSchema.nullable().optional(),
+          })
+          .refine(
+            (value) =>
+              value.status !== undefined || value.projectId !== undefined,
+          )
+          .parse(input);
+        return this.vault.updateTask(a.documentId, a.taskId, a.baseRevision, a);
       }
       case "tasks.move": {
         const a = z

@@ -1,0 +1,214 @@
+.modal-backdrop:has(> .project-edit-modal) {
+  align-items: center;
+  padding: 32px 24px;
+  background: #00000026;
+  backdrop-filter: blur(3px);
+}
+.project-edit-modal {
+  width: 440px;
+  max-height: min(560px, calc(100dvh - 48px));
+  border: 1px solid #e6e6e6;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 24px 80px #20202026;
+  color: #242424;
+}
+.project-edit-modal .modal-header {
+  height: auto;
+  min-height: 0;
+  padding: 16px 16px 0;
+  border: 0;
+}
+.project-edit-modal .modal-header h2 {
+  font-size: 18px;
+  line-height: 24px;
+  font-weight: 600;
+  letter-spacing: -0.35px;
+  color: #202020;
+}
+.project-edit-modal .modal-header > .icon-button {
+  width: 24px;
+  height: 24px;
+  color: #777;
+}
+.project-edit-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.project-edit-body {
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+}
+.project-name-field {
+  display: flex;
+  min-height: 40px;
+  border: 1px solid #dedede;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.project-name-field > .project-browse-button {
+  width: 40px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-right: 1px solid #e6e6e6;
+}
+.project-browse-button {
+  color: #555;
+  transition: background var(--transition);
+}
+.project-browse-button:hover:not(:disabled) {
+  background: #f5f5f5;
+}
+.project-name-field > .project-browse-button:focus-visible {
+  outline-offset: -3px;
+}
+.project-name-field input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  font-size: 14px;
+  line-height: 20px;
+  color: #242424;
+}
+.project-name-field:focus-within {
+  border-color: #b6b6b6;
+  box-shadow: 0 0 0 2px #20202008;
+}
+.project-name-field input:focus-visible {
+  box-shadow: none;
+}
+.project-folder-picker {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fff;
+}
+.project-folder-picker > input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #e3e3e3;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 20px;
+}
+.project-folder-picker > div {
+  max-height: 160px;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+.project-folder-picker button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  text-align: left;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 20px;
+  color: #666;
+}
+.project-folder-picker button:hover,
+.project-folder-picker button[aria-pressed="true"] {
+  background: #f5f5f5;
+}
+.project-folder-picker button:active:not(:disabled),
+.project-browse-button:active:not(:disabled) {
+  background: #eaeaea;
+}
+.project-folder-picker button > span {
+  flex: 1;
+}
+.project-folder-picker button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-folder-picker p {
+  padding: 8px;
+  color: #929292;
+  font-size: 14px;
+  line-height: 20px;
+}
+.project-edit-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 16px 16px;
+}
+.project-edit-footer > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.project-edit-footer.is-creating {
+  justify-content: flex-end;
+}
+.project-edit-footer button {
+  min-height: 32px;
+  padding: 4px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
+  transition:
+    background var(--transition),
+    color var(--transition);
+  white-space: nowrap;
+}
+.project-remove-button {
+  background: #fdf0ee;
+  color: #d85850;
+}
+.project-remove-button:hover:not(:disabled) {
+  background: #fbe3df;
+}
+.project-cancel-button {
+  color: #858585;
+}
+.project-cancel-button:hover:not(:disabled) {
+  background: #f5f5f5;
+  color: #444;
+}
+.project-save-button {
+  min-width: 64px;
+  background: #242424;
+  color: #fff;
+}
+.project-save-button:hover:not(:disabled) {
+  background: #444;
+}
+.project-edit-footer button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.project-edit-footer button:disabled,
+.project-edit-body button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.project-edit-error {
+  margin-top: 16px;
+  font-size: 14px;
+  line-height: 20px;
+  color: #c34e46;
+}
+@media (max-width: 480px) {
+  .modal-backdrop:has(> .project-edit-modal) {
+    padding: 12px;
+  }
+  .project-edit-modal {
+    max-height: calc(100dvh - 24px);
+  }
+  .project-edit-footer button {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+}

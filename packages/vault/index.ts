@@ -6,6 +6,8 @@ import { subscribe, type AsyncSubscription } from "@parcel/watcher";
 import {
   changeSetSchema,
   FableError,
+  projectSettingsSchema,
+  type ProjectSettings,
   type ChangeSet,
   type DocumentSnapshot,
   type DocumentKind,
@@ -13,12 +15,15 @@ import {
   type HistoryEntry,
   type ViewSettings,
   type SidebarReorder,
+  type WorkStatus,
 } from "../contracts/index.ts";
 import {
   parseMarkdown,
   revisionOf,
   patchMetadata,
+  setDocumentTitle,
   toggleTask,
+  updateTask,
   moveTask,
   applyEdits,
   relativeLinkEdits,
@@ -42,12 +47,18 @@ interface FileVersion {
   path: string;
   raw: string | null;
 }
+interface DirectoryVersion {
+  path: string;
+  exists: boolean;
+}
 interface Journal {
   id: string;
   summary: string;
   createdAt: string;
   before: FileVersion[];
   after: FileVersion[];
+  beforeDirectories?: DirectoryVersion[];
+  afterDirectories?: DirectoryVersion[];
   state: "prepared" | "committed";
 }
 export const portableName = (name: string) => {
@@ -386,6 +397,121 @@ export class VaultService extends EventEmitter {
       return this.state;
     });
   }
+  private descendants(ids: Set<string>) {
+    let size: number;
+    do {
+      size = ids.size;
+      for (const doc of this.documents)
+        if (doc.metadata.parent && ids.has(doc.metadata.parent))
+          ids.add(doc.id);
+    } while (ids.size !== size);
+    return this.documents.filter((doc) => ids.has(doc.id));
+  }
+  private async folderDeletion(
+    directory: string,
+    documents: DocumentSnapshot[],
+  ) {
+    const absolute = await this.safePath(directory);
+    try {
+      await fs.access(absolute);
+    } catch (error: any) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
+    const paths = new Set(documents.map((doc) => doc.path));
+    const directories: DirectoryVersion[] = [];
+    const visit = async (relative: string) => {
+      const absolute = await this.safePath(relative);
+      for (const entry of await fs.readdir(absolute, { withFileTypes: true })) {
+        const child = `${relative}/${entry.name}`;
+        await this.safePath(child);
+        if (entry.isDirectory()) await visit(child);
+        else if (!entry.isFile() || !paths.has(child))
+          throw new FableError(
+            "VALIDATION",
+            "This folder contains files outside this selection. Move them out before deleting it.",
+          );
+      }
+      directories.push({ path: relative, exists: false });
+    };
+    await visit(directory);
+    return directories;
+  }
+  async deleteDocument(id: string, baseRevision: string) {
+    return this.lock(async () => {
+      const doc = this.document(id);
+      await this.assertRevision(doc, baseRevision);
+      const documents = this.descendants(new Set([id]));
+      const directories = ["project", "area"].includes(doc.kind)
+        ? await this.folderDeletion(documentFolder(doc), documents)
+        : [];
+      return this.applyUnlocked(
+        {
+          id: randomUUID(),
+          summary: `Delete ${doc.title}`,
+          changes: documents.map((item) => ({
+            type: "trash",
+            documentId: item.id,
+            baseRevision: item.revision,
+          })),
+        },
+        directories,
+      );
+    });
+  }
+  async deleteFolder(
+    parentId: string,
+    directory: string,
+    baseRevision: string,
+  ) {
+    return this.lock(async () => {
+      const parent = this.document(parentId),
+        base = documentFolder(parent);
+      if (
+        !["project", "area"].includes(parent.kind) ||
+        !directory.startsWith(base + "/")
+      )
+        throw new FableError(
+          "VALIDATION",
+          "Choose a subfolder inside this project or area.",
+        );
+      await this.safePath(directory);
+      await this.assertRevision(parent, baseRevision);
+      if (!(await fs.stat(await this.safePath(directory))).isDirectory())
+        throw new FableError("VALIDATION", "Choose a folder to delete.");
+      const documents = this.descendants(
+        new Set(
+          this.documents
+            .filter((doc) => doc.path.startsWith(directory + "/"))
+            .map((doc) => doc.id),
+        ),
+      );
+      if (
+        documents.some(
+          (doc) =>
+            (projectFor(doc, this.documents) ?? areaFor(doc, this.documents))
+              ?.id !== parentId,
+        )
+      )
+        throw new FableError(
+          "VALIDATION",
+          "This folder contains pages from another project or area.",
+        );
+      const directories = await this.folderDeletion(directory, documents);
+      return this.applyUnlocked(
+        {
+          id: randomUUID(),
+          summary: `Delete folder ${path.posix.basename(directory)}`,
+          changes: documents.map((doc) => ({
+            type: "trash",
+            documentId: doc.id,
+            baseRevision: doc.revision,
+          })),
+        },
+        directories,
+      );
+    });
+  }
   async save(id: string, baseRevision: string, raw: string) {
     const doc = this.document(id);
     await this.apply({
@@ -401,6 +527,119 @@ export class VaultService extends EventEmitter {
       ],
     });
     return this.documents.find((d) => d.path === doc.path)!;
+  }
+  private async validateProjectSettings(
+    input: ProjectSettings,
+    implicitFolder?: string,
+  ) {
+    const values = projectSettingsSchema.parse(input);
+    const sourceFolders = [...new Set(values.sourceFolders)];
+    for (const folder of sourceFolders) {
+      const absolute = await this.safePath(folder);
+      if (folder === implicitFolder) continue;
+      if (
+        folder.startsWith(".fable") ||
+        folder === "Attachments" ||
+        folder.startsWith("Attachments/")
+      )
+        throw new FableError(
+          "VALIDATION",
+          "Choose a project folder in this workspace.",
+        );
+      const exists = await fs.stat(absolute).catch(() => null);
+      if (!exists?.isDirectory())
+        throw new FableError(
+          "VALIDATION",
+          `The folder “${folder}” is no longer available.`,
+        );
+    }
+    const files = [
+      ...new Map(values.files.map((file) => [file.path, file])).values(),
+    ];
+    for (const file of files) {
+      const info = await fs
+        .stat(await this.safePath(file.path))
+        .catch(() => null);
+      if (!info?.isFile())
+        throw new FableError(
+          "VALIDATION",
+          `The file “${file.name}” is no longer available.`,
+        );
+      if (info.size !== file.size)
+        throw new FableError(
+          "VALIDATION",
+          `The file “${file.name}” changed. Upload it again.`,
+        );
+    }
+
+    return { ...values, sourceFolders, files };
+  }
+  async createProject(parentId: string, input: ProjectSettings) {
+    return this.lock(async () => {
+      const owner = this.document(parentId);
+      if (owner.kind !== "area")
+        throw new FableError("VALIDATION", "Choose an area for this project.");
+      const values = await this.validateProjectSettings(input);
+      const folder = `Projects/${portableName(owner.title)}`;
+      await this.safePath(folder);
+      let relative = `${folder}/${portableName(values.title)}.md`,
+        suffix = 2;
+      while (
+        this.documents.some(
+          (doc) =>
+            doc.path.toLocaleLowerCase() === relative.toLocaleLowerCase(),
+        )
+      )
+        relative = `${folder}/${portableName(values.title)} ${suffix++}.md`;
+      const id = randomUUID();
+      const raw = patchMetadata(setDocumentTitle("", values.title), {
+        schema: 1,
+        id,
+        kind: "project",
+        status: "todo",
+        rank: Date.now().toString(),
+        parent: parentId,
+        source_folders: values.sourceFolders,
+        project_files: values.files,
+      });
+      await this.applyUnlocked({
+        id: randomUUID(),
+        summary: `Create project ${values.title}`,
+        changes: [{ type: "create", path: relative, raw }],
+      });
+      return this.document(id);
+    });
+  }
+  async updateProject(
+    id: string,
+    baseRevision: string,
+    input: ProjectSettings,
+  ) {
+    return this.lock(async () => {
+      const project = this.document(id);
+      if (project.kind !== "project")
+        throw new FableError("VALIDATION", "Choose a project to edit.");
+      await this.assertRevision(project, baseRevision);
+      const { title, sourceFolders, files } =
+        await this.validateProjectSettings(input, documentFolder(project));
+      const raw = patchMetadata(setDocumentTitle(project.raw, title), {
+        source_folders: sourceFolders,
+        project_files: files,
+      });
+      await this.applyUnlocked({
+        id: randomUUID(),
+        summary: `Edit project ${title}`,
+        changes: [
+          {
+            type: "patch",
+            documentId: id,
+            baseRevision,
+            edits: [{ from: 0, to: project.raw.length, insert: raw }],
+          },
+        ],
+      });
+      return this.document(id);
+    });
   }
   async preserveDraft(title: string, raw: string) {
     const relative = `Conflicts/${portableName(title)} ${randomUUID().slice(0, 8)}.md`,
@@ -445,17 +684,58 @@ export class VaultService extends EventEmitter {
     const doc = this.document(documentId);
     return this.save(doc.id, baseRevision, moveTask(doc, taskId, beforeTaskId));
   }
-  async addTask(title: string, documentId?: string) {
+  async updateTask(
+    documentId: string,
+    taskId: string,
+    baseRevision: string,
+    values: { status?: WorkStatus; projectId?: string | null },
+  ) {
+    const doc = this.document(documentId);
+    if (values.projectId) {
+      const project = this.document(values.projectId);
+      if (
+        project.kind !== "project" ||
+        areaFor(project, this.documents)?.id !==
+          areaFor(doc, this.documents)?.id
+      )
+        throw new FableError("VALIDATION", "Choose a project in this area.");
+    }
+    return this.save(doc.id, baseRevision, updateTask(doc, taskId, values));
+  }
+  async addTask(
+    title: string,
+    documentId?: string,
+    options: { status?: WorkStatus; areaId?: string } = {},
+  ) {
+    const area = options.areaId ? this.document(options.areaId) : undefined;
+    if (area && area.kind !== "area")
+      throw new FableError("VALIDATION", "Choose an area for this task.");
     let doc = documentId
       ? this.document(documentId)
-      : this.documents.find((d) => d.path === "Notes/Inbox.md");
-    if (!doc) doc = await this.create("Inbox", "note");
+      : this.documents.find((d) =>
+          area
+            ? d.kind === "note" &&
+              d.metadata.parent === area.id &&
+              d.title === "Tasks"
+            : d.path === "Notes/Inbox.md",
+        );
+    if (!doc)
+      doc = await this.create(area ? "Tasks" : "Inbox", "note", area?.id);
+    if (
+      doc.kind === "conversation" ||
+      (area && areaFor(doc, this.documents)?.id !== area.id)
+    )
+      throw new FableError(
+        "VALIDATION",
+        "Choose a task destination in this area.",
+      );
+    const status = options.status ?? "todo";
     const eol = doc.raw.includes("\r\n") ? "\r\n" : "\n";
     return this.save(
       doc.id,
       doc.revision,
       doc.raw.replace(/\s*$/, "") +
-        `${eol}${eol}- [ ] ${title.replace(/[\r\n]+/g, " ").trim()} <!-- fable:task ${JSON.stringify({ id: randomUUID() })} -->${eol}`,
+        `${eol}${eol}- [${status === "done" ? "x" : " "}] ${title.replace(/[\r\n]+/g, " ").trim()} <!-- fable:task ${JSON.stringify({ id: randomUUID(), status, ...(status === "done" ? { completed_at: new Date().toISOString() } : {}) })} -->${eol}`,
     );
   }
   async movePage(
@@ -644,7 +924,10 @@ export class VaultService extends EventEmitter {
   async apply(input: ChangeSet) {
     return this.lock(() => this.applyUnlocked(changeSetSchema.parse(input)));
   }
-  private async applyUnlocked(set: ChangeSet) {
+  private async applyUnlocked(
+    set: ChangeSet,
+    directories: DirectoryVersion[] = [],
+  ) {
     const completed = path.join(this.root, ".fable/history", `${set.id}.md`);
     try {
       await fs.access(completed);
@@ -721,16 +1004,37 @@ export class VaultService extends EventEmitter {
     for (const [p, raw] of staged)
       if (raw !== null) next.push(parseMarkdown(p, raw));
     validateHierarchy(next);
+    const beforeDirectories: DirectoryVersion[] = [];
+    for (const directory of directories) {
+      let exists = false;
+      try {
+        const stat = await fs.stat(await this.safePath(directory.path));
+        if (!stat.isDirectory())
+          throw new FableError("CONFLICT", "A file uses this folder path.");
+        exists = true;
+      } catch (error: any) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      if (exists === directory.exists)
+        throw new FableError(
+          "STALE_REVISION",
+          "This folder changed. Refresh before trying again.",
+        );
+      beforeDirectories.push({ path: directory.path, exists });
+    }
     const journal: Journal = {
       id: set.id,
       summary: set.summary,
       createdAt: new Date().toISOString(),
       before: [...before].map(([p, raw]) => ({ path: p, raw })),
       after: [...staged].map(([p, raw]) => ({ path: p, raw })),
+      beforeDirectories,
+      afterDirectories: directories,
       state: "prepared",
     };
     const journalFile = `.fable/journal/${set.id}.md`;
     await this.atomic(journalFile, encodeJournal(journal), true);
+    await this.writeDirectories(directories, true);
     for (const after of journal.after) {
       const expected = before.get(after.path);
       const absolute = await this.safePath(after.path);
@@ -748,6 +1052,7 @@ export class VaultService extends EventEmitter {
       if (after.raw === null) await fs.rm(absolute, { force: true });
       else await this.atomic(after.path, after.raw);
     }
+    await this.writeDirectories(directories, false);
     journal.state = "committed";
     await this.atomic(
       `.fable/history/${set.id}.md`,
@@ -757,6 +1062,33 @@ export class VaultService extends EventEmitter {
     await fs.rm(path.join(this.root, journalFile), { force: true });
     await this.scan();
     return this.state;
+  }
+  private async writeDirectories(
+    directories: DirectoryVersion[],
+    exists: boolean,
+    recovering = false,
+  ) {
+    const ordered = directories
+      .filter((directory) => directory.exists === exists)
+      .sort((a, b) =>
+        exists ? a.path.length - b.path.length : b.path.length - a.path.length,
+      );
+    for (const directory of ordered) {
+      const absolute = await this.safePath(directory.path);
+      if (exists) await fs.mkdir(absolute, { recursive: true });
+      else {
+        try {
+          await fs.rmdir(absolute);
+        } catch (error: any) {
+          if (
+            recovering &&
+            ["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)
+          )
+            continue;
+          throw error;
+        }
+      }
+    }
   }
   async atomic(relative: string, raw: string | Uint8Array, internal = false) {
     const absolute = await this.safePath(relative, internal);
@@ -803,7 +1135,10 @@ export class VaultService extends EventEmitter {
             id: j.id,
             summary: j.summary,
             createdAt: j.createdAt,
-            paths: j.after.map((v) => v.path),
+            paths: [
+              ...j.after.map((v) => v.path),
+              ...(j.afterDirectories ?? []).map((v) => v.path),
+            ],
           };
         }),
     );
@@ -812,56 +1147,77 @@ export class VaultService extends EventEmitter {
       .slice(0, 100);
   }
   async undo(id: string) {
-    if (!/^[\w-]+$/.test(id))
-      throw new FableError("VALIDATION", "Invalid history ID.");
-    const j = decodeJournal(
-      await fs.readFile(
-        path.join(this.root, ".fable/history", `${id}.md`),
-        "utf8",
-      ),
-    );
-    const changes: ChangeSet["changes"] = [];
-    for (const after of j.after) {
-      const before = j.before.find((v) => v.path === after.path)?.raw ?? null;
-      const doc = this.documents.find((d) => d.path === after.path);
-      if (after.raw === null && doc)
-        throw new FableError(
-          "STALE_REVISION",
-          "A new file uses this path. Restore the old content to a different filename.",
-        );
-      if (
-        after.raw !== null &&
-        (!doc || doc.revision !== revisionOf(after.raw))
-      )
-        throw new FableError(
-          "STALE_REVISION",
-          "This file has newer edits. Restore its content manually from history.",
-        );
-      if (before === null && doc)
-        changes.push({
-          type: "trash",
-          documentId: doc.id,
-          baseRevision: doc.revision,
-        });
-      else if (before !== null && doc)
-        changes.push({
-          type: "patch",
-          documentId: doc.id,
-          baseRevision: doc.revision,
-          edits: [{ from: 0, to: doc.raw.length, insert: before }],
-        });
-      else if (before !== null)
-        changes.push({ type: "create", path: after.path, raw: before });
-    }
-    return changes.length
-      ? this.apply({ id: randomUUID(), summary: `Undo: ${j.summary}`, changes })
-      : this.state;
+    return this.lock(async () => {
+      if (!/^[\w-]+$/.test(id))
+        throw new FableError("VALIDATION", "Invalid history ID.");
+      const j = decodeJournal(
+        await fs.readFile(
+          path.join(this.root, ".fable/history", `${id}.md`),
+          "utf8",
+        ),
+      );
+      const changes: ChangeSet["changes"] = [];
+      for (const after of j.after) {
+        const before = j.before.find((v) => v.path === after.path)?.raw ?? null;
+        const doc = this.documents.find((d) => d.path === after.path);
+        if (after.raw === null && doc)
+          throw new FableError(
+            "STALE_REVISION",
+            "A new file uses this path. Restore the old content to a different filename.",
+          );
+        if (
+          after.raw !== null &&
+          (!doc || doc.revision !== revisionOf(after.raw))
+        )
+          throw new FableError(
+            "STALE_REVISION",
+            "This file has newer edits. Restore its content manually from history.",
+          );
+        if (before === null && doc)
+          changes.push({
+            type: "trash",
+            documentId: doc.id,
+            baseRevision: doc.revision,
+          });
+        else if (before !== null && doc)
+          changes.push({
+            type: "patch",
+            documentId: doc.id,
+            baseRevision: doc.revision,
+            edits: [{ from: 0, to: doc.raw.length, insert: before }],
+          });
+        else if (before !== null)
+          changes.push({ type: "create", path: after.path, raw: before });
+      }
+      for (const directory of j.afterDirectories ?? []) {
+        let exists = false;
+        try {
+          exists = (
+            await fs.stat(await this.safePath(directory.path))
+          ).isDirectory();
+        } catch (error: any) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        if (exists !== directory.exists)
+          throw new FableError(
+            "STALE_REVISION",
+            "This folder has newer changes. Restore its contents manually from history.",
+          );
+      }
+      return changes.length || j.beforeDirectories?.length
+        ? this.applyUnlocked(
+            { id: randomUUID(), summary: `Undo: ${j.summary}`, changes },
+            j.beforeDirectories,
+          )
+        : this.state;
+    });
   }
   async recover() {
     const dir = path.join(this.root, ".fable/journal");
     for (const file of await fs.readdir(dir)) {
       if (!file.endsWith(".md")) continue;
       const j = decodeJournal(await fs.readFile(path.join(dir, file), "utf8"));
+      await this.writeDirectories(j.afterDirectories ?? [], true, true);
       for (const after of j.after) {
         const absolute = await this.safePath(after.path);
         let current: string | null = null;
@@ -883,6 +1239,7 @@ export class VaultService extends EventEmitter {
         if (after.raw === null) await fs.rm(absolute, { force: true });
         else await this.atomic(after.path, after.raw);
       }
+      await this.writeDirectories(j.afterDirectories ?? [], false, true);
       j.state = "committed";
       await this.atomic(`.fable/history/${j.id}.md`, encodeJournal(j), true);
       await fs.rm(path.join(dir, file));

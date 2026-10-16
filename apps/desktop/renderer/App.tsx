@@ -18,6 +18,8 @@ import {
 } from "../../../packages/domain/index.ts";
 import { AreaSidebar } from "./AreaSidebar.tsx";
 import { ProjectPages } from "./ProjectPages.tsx";
+import { ProjectDialog } from "./ProjectDialog.tsx";
+import { TaskBoard } from "./TaskBoard.tsx";
 import {
   kinds,
   statuses,
@@ -32,15 +34,10 @@ import {
   type SidebarReorder,
 } from "../../../packages/contracts/index.ts";
 import { IconButton, Modal, StatusIcon, EmptyState } from "./components.tsx";
-import {
-  ProjectsView,
-  TasksView,
-  GoalsView,
-  NotesView,
-  InsightsView,
-  CompletedView,
-} from "./Views.tsx";
+import { GoalsView, NotesView, InsightsView, CompletedView } from "./Views.tsx";
 import { MarkdownEditor, type EditorHandle } from "./Editor.tsx";
+import { DocumentToolbar, DocumentInsertPanel } from "./DocumentChrome.tsx";
+import { emptyFormatting } from "./editor-commands.ts";
 import {
   AIPanel,
   ChangeReview,
@@ -58,7 +55,6 @@ interface Tab {
 const navigation: [ViewId, string, IconName][] = [
   ["areas", "Areas", "areas"],
   ["goals", "Goals", "goals"],
-  ["projects", "Projects", "projects"],
   ["tasks", "Tasks", "tasks"],
   ["insights", "Insights", "insights"],
   ["completed", "Completed", "completed"],
@@ -67,33 +63,29 @@ const viewTitle = (id: ViewId) =>
   navigation.find((v) => v[0] === id)?.[1] ?? "Notes";
 const initialView = () => {
   const value = new URLSearchParams(window.location.search).get("view");
-  return [
-    "areas",
-    "goals",
-    "projects",
-    "tasks",
-    "insights",
-    "completed",
-    "notes",
-  ].includes(value ?? "")
+  return ["areas", "goals", "tasks", "insights", "completed", "notes"].includes(
+    value ?? "",
+  )
     ? (value as ViewId)
-    : "projects";
+    : "tasks";
 };
 
 export function App() {
   const [vault, setVault] = useState<VaultState | null>(null),
     [loading, setLoading] = useState(true),
     [tabs, setTabs] = useState<Tab[]>([]),
-    [active, setActive] = useState("view:projects"),
+    [active, setActive] = useState("view:tasks"),
     [folders, setFolders] = useState(false),
     [bookmarks, setBookmarks] = useState(false),
     [pinned, setPinned] = useState<string[]>([]),
     [hiddenColumns, setHiddenColumns] = useState<WorkStatus[]>(["done"]);
-  const [sidebarWidth, setSidebarWidth] = useState(240),
+  const [sidebarWidth, setSidebarWidth] = useState(272),
     [sidebarHidden, setSidebarHidden] = useState(false),
     [aiOpen, setAiOpen] = useState(false),
     [source, setSource] = useState(false),
     [properties, setProperties] = useState(false),
+    [insertOpen, setInsertOpen] = useState(true),
+    [formatting, setFormatting] = useState(emptyFormatting),
     [saveStatus, setSaveStatus] = useState("Saved");
   const [palette, setPalette] = useState(false),
     [paletteQuery, setPaletteQuery] = useState(""),
@@ -112,6 +104,9 @@ export function App() {
     [message, setMessage] = useState(""),
     [undoAvailable, setUndoAvailable] = useState(false);
   const [selectedAreaId, setSelectedAreaId] = useState<string | null>(null),
+    [editingProject, setEditingProject] = useState<DocumentSnapshot | null>(
+      null,
+    ),
     [newFolder, setNewFolder] = useState<{
       parentId: string;
       directory?: string;
@@ -386,10 +381,11 @@ export function App() {
     setProperties(false);
     setMore(false);
     setBookmarks(false);
+    const view = "tasks";
     const tab: Tab = {
-      id: "view:projects",
-      title: "Projects",
-      view: "projects",
+      id: `view:${view}`,
+      title: viewTitle(view),
+      view,
     };
     setTabs([tab]);
     setActive(tab.id);
@@ -508,6 +504,38 @@ export function App() {
       notify(e.message);
     }
   };
+  const receiveDeletion = (state: VaultState, label: string) => {
+    const ids = new Set(state.documents.map((doc) => doc.id));
+    const surviving = tabs.filter(
+      (tab) => !tab.documentId || ids.has(tab.documentId),
+    );
+    if (!surviving.length)
+      surviving.push({ id: "view:tasks", title: "Tasks", view: "tasks" });
+    if (!surviving.some((tab) => tab.id === active)) {
+      setActive(surviving.at(-1)!.id);
+      previousDocument.current = undefined;
+      setSaveStatus("Saved");
+    }
+    setTabs(surviving);
+    history.current = history.current.filter(
+      (tab) => !tab.documentId || ids.has(tab.documentId),
+    );
+    if (!history.current.length) history.current = [surviving.at(-1)!];
+    position.current = Math.min(position.current, history.current.length - 1);
+    receive(state);
+    notify(`${label} deleted`, true);
+  };
+  const deleteDocument = async (id: string) => {
+    if (editor.current && !(await editor.current.flush()))
+      throw new Error("Save or preserve the current draft before deleting.");
+    const latest = await api.request("vault.state", undefined);
+    const doc = latest?.documents.find((item) => item.id === id);
+    if (!doc) throw new Error("This file is no longer available.");
+    receiveDeletion(
+      await api.request("documents.trash", { id, baseRevision: doc.revision }),
+      doc.kind === "project" ? "Project" : "File",
+    );
+  };
   const undo = async () => {
     try {
       if (editor.current && !(await editor.current.flush())) return;
@@ -587,12 +615,176 @@ export function App() {
   const isProjectPage = document?.kind === "note" && !!currentProject;
   const title = document?.title ?? current?.title ?? "Fable";
   const isNativeMac = !!window.fable && api.platform === "darwin";
+  const attachFile = async (imageOnly = false) => {
+    if (!document) return;
+    try {
+      if (!window.fable) {
+        const input = window.document.createElement("input");
+        input.type = "file";
+        input.accept = imageOnly ? "image/*" : "image/*,.pdf,.txt,.csv";
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          try {
+            if (file.size > 50 * 1024 * 1024)
+              throw new Error("Attachments must be 50 MB or smaller.");
+            const data = await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () =>
+                resolve(String(reader.result).split(",")[1]);
+              reader.onerror = () =>
+                reject(new Error("The attachment could not be read."));
+              reader.readAsDataURL(file);
+            });
+            const relative = await api.request("attachments.add", {
+              name: file.name,
+              data,
+            });
+            if (relative && docRef.current?.id === document.id)
+              editor.current?.insert(
+                `\n${file.type.startsWith("image/") ? "!" : ""}[${file.name.replace(/[\[\]\\]/g, "\\$&")}](${relativeVaultHref(document.path, relative)})\n`,
+              );
+          } catch (e: any) {
+            notify(e.message);
+          }
+        };
+        input.click();
+      } else {
+        const relative = await api.request("attachments.add", {});
+        if (relative && docRef.current?.id === document.id)
+          editor.current?.insert(
+            `\n${/\.(png|jpe?g|gif|webp|avif|svg)$/i.test(relative) ? "!" : ""}[${relative
+              .split("/")
+              .at(-1)!
+              .replace(
+                /[\[\]\\]/g,
+                "\\$&",
+              )}](${relativeVaultHref(document.path, relative)})\n`,
+          );
+      }
+    } catch (e: any) {
+      notify(e.message);
+    }
+  };
+  const historyControls = (
+    <div className="history-controls">
+      {sidebarHidden && (
+        <IconButton
+          icon="sidebar"
+          label="Show sidebar"
+          onClick={() => setSidebarHidden(false)}
+        />
+      )}
+      <IconButton
+        icon="left"
+        label="Back"
+        disabled={position.current <= 0}
+        size={17}
+        onClick={() => goHistory(-1)}
+      />
+      <IconButton
+        icon="right"
+        label="Forward"
+        disabled={position.current >= history.current.length - 1}
+        size={17}
+        onClick={() => goHistory(1)}
+      />
+    </div>
+  );
+  const pageOptions = (
+    <div className="overflow-anchor">
+      <IconButton
+        icon="more"
+        label="Page options"
+        size={18}
+        onClick={() => setMore(!more)}
+      />
+      {more && (
+        <div className="overflow-menu">
+          <button
+            onClick={() => {
+              setMore(false);
+              setCreate(
+                currentProject
+                  ? {
+                      kind: "note",
+                      parent: currentProject.id,
+                      projectId: currentProject.id,
+                    }
+                  : { kind: document?.kind ?? "note" },
+              );
+            }}
+          >
+            <Icon name="add" size={15} />
+            New {currentProject ? "page" : (document?.kind ?? "note")}
+          </button>
+          <button
+            onClick={() => {
+              setMore(false);
+              setAiOpen(true);
+            }}
+          >
+            <Icon name="ai" size={15} />
+            Ask your assistant
+          </button>
+          {document && (
+            <>
+              <button
+                onClick={() => {
+                  setMore(false);
+                  setSource(!source);
+                }}
+              >
+                <Icon name="code" size={15} />
+                Toggle Markdown source
+              </button>
+              <button
+                onClick={async () => {
+                  setMore(false);
+                  try {
+                    await deleteDocument(document.id);
+                  } catch (e: any) {
+                    notify(e.message);
+                  }
+                }}
+              >
+                <Icon name="trash" size={15} />
+                Delete
+              </button>
+            </>
+          )}
+          <button
+            onClick={() => {
+              setMore(false);
+              setSettings("history");
+            }}
+          >
+            <Icon name="waiting" size={15} />
+            Local history
+          </button>
+        </div>
+      )}
+    </div>
+  );
   let content: ReactNode;
   if (document)
     content = (
       <section className="document-page">
-        <div className="document-tools">
+        <DocumentToolbar
+          navigation={historyControls}
+          editor={editor}
+          formatting={formatting}
+          source={source}
+          onSource={() => setSource(!source)}
+          insertOpen={insertOpen}
+          onInsert={() => setInsertOpen(!insertOpen)}
+        >
+          <span className="save-status" role="status">
+            {saveStatus}
+          </span>
           <button
+            aria-label="Page properties"
+            title="Page properties"
             className={`properties-toggle ${properties ? "selected" : ""}`}
             onClick={() => setProperties(!properties)}
           >
@@ -616,9 +808,6 @@ export function App() {
             </span>
             <Icon name="down" size={12} />
           </button>
-          <span className="save-status" role="status">
-            {saveStatus}
-          </span>
           <IconButton
             icon="bookmark"
             label={
@@ -638,232 +827,188 @@ export function App() {
               )
             }
           />
-          <IconButton
-            icon={source ? "view" : "code"}
-            label={source ? "Live preview" : "Markdown source"}
-            onClick={() => setSource(!source)}
-          />
-          <IconButton
-            icon="attachment"
-            label="Attach a file"
-            onClick={async () => {
-              try {
-                if (!window.fable) {
-                  const input = window.document.createElement("input");
-                  input.type = "file";
-                  input.accept = "image/*,.pdf,.txt,.csv";
-                  input.onchange = async () => {
-                    const file = input.files?.[0];
-                    if (!file) return;
-                    try {
-                      if (file.size > 50 * 1024 * 1024)
-                        throw new Error(
-                          "Attachments must be 50 MB or smaller.",
-                        );
-                      const data = await new Promise<string>(
-                        (resolve, reject) => {
-                          const reader = new FileReader();
-                          reader.onload = () =>
-                            resolve(String(reader.result).split(",")[1]);
-                          reader.onerror = () =>
-                            reject(
-                              new Error("The attachment could not be read."),
-                            );
-                          reader.readAsDataURL(file);
-                        },
-                      );
-                      const relative = await api.request("attachments.add", {
-                        name: file.name,
-                        data,
-                      });
-                      if (relative && docRef.current?.id === document.id)
-                        editor.current?.insert(
-                          `\n${file.type.startsWith("image/") ? "!" : ""}[${file.name.replace(/[\[\]\\]/g, "\\$&")}](${relativeVaultHref(document.path, relative)})\n`,
-                        );
-                    } catch (e: any) {
-                      notify(e.message);
+          {pageOptions}
+        </DocumentToolbar>
+        <div
+          className={`document-layout ${insertOpen ? "has-insert-panel" : ""}`}
+        >
+          <div className="document-canvas">
+            {properties && (
+              <div className="properties-panel">
+                <label>
+                  Type
+                  <select
+                    value={document.kind}
+                    onChange={(e) =>
+                      updateMetadata(document.id, {
+                        kind: e.target.value,
+                      }).catch((e) => notify(e.message))
                     }
-                  };
-                  input.click();
-                } else {
-                  const relative = await api.request("attachments.add", {});
-                  if (relative && docRef.current?.id === document.id)
-                    editor.current?.insert(
-                      `\n${/\.(png|jpe?g|gif|webp|avif|svg)$/i.test(relative) ? "!" : ""}[${relative
-                        .split("/")
-                        .at(-1)!
-                        .replace(
-                          /[\[\]\\]/g,
-                          "\\$&",
-                        )}](${relativeVaultHref(document.path, relative)})\n`,
-                    );
-                }
-              } catch (e: any) {
-                notify(e.message);
-              }
-            }}
-          />
-        </div>
-        {properties && (
-          <div className="properties-panel">
-            <label>
-              Type
-              <select
-                value={document.kind}
-                onChange={(e) =>
-                  updateMetadata(document.id, { kind: e.target.value }).catch(
-                    (e) => notify(e.message),
-                  )
-                }
-              >
-                {kinds
-                  .filter((k) => k !== "conversation")
-                  .map((kind) => (
-                    <option key={kind} value={kind}>
-                      {kind === "note" && isProjectPage
-                        ? "Page"
-                        : kind.charAt(0).toUpperCase() + kind.slice(1)}
+                  >
+                    {kinds
+                      .filter((k) => k !== "conversation")
+                      .map((kind) => (
+                        <option key={kind} value={kind}>
+                          {kind === "note" && isProjectPage
+                            ? "Page"
+                            : kind.charAt(0).toUpperCase() + kind.slice(1)}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                {document.kind === "goal" && (
+                  <label>
+                    Status
+                    <select
+                      value={document.metadata.status}
+                      onChange={(e) =>
+                        updateMetadata(document.id, {
+                          status: e.target.value,
+                          ...(e.target.value === "done"
+                            ? { completed_at: new Date().toISOString() }
+                            : { completed_at: null }),
+                        }).catch((e) => notify(e.message))
+                      }
+                    >
+                      {statuses.map((s) => (
+                        <option value={s} key={s}>
+                          {statusLabels[s]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <label>
+                  {document.kind === "project" ? "Area" : "Parent"}
+                  <select
+                    value={
+                      document.kind === "project"
+                        ? (areaFor(document, vault?.documents ?? [])?.id ?? "")
+                        : (document.metadata.parent ?? "")
+                    }
+                    onChange={async (e) => {
+                      const parent = e.target.value || null;
+                      try {
+                        if (await updateMetadata(document.id, { parent })) {
+                          const state = await api.request(
+                            "vault.state",
+                            undefined,
+                          );
+                          if (state) receive(state);
+                          await openDocument(document.id);
+                          setProperties(true);
+                        }
+                      } catch (error: any) {
+                        notify(error.message);
+                      }
+                    }}
+                  >
+                    <option value="" disabled={document.kind === "project"}>
+                      {document.kind === "project"
+                        ? "Choose an area"
+                        : "No parent"}
                     </option>
-                  ))}
-              </select>
-            </label>
-            {["goal", "project"].includes(document.kind) && (
-              <label>
-                Status
-                <select
-                  value={document.metadata.status}
-                  onChange={(e) =>
-                    updateMetadata(document.id, {
-                      status: e.target.value,
-                      ...(e.target.value === "done"
-                        ? { completed_at: new Date().toISOString() }
-                        : { completed_at: null }),
-                    }).catch((e) => notify(e.message))
+                    {vault?.documents
+                      .filter(
+                        (d) =>
+                          d.id !== document.id &&
+                          (document.kind === "project"
+                            ? d.kind === "area"
+                            : document.kind === "goal"
+                              ? ["area", "goal"].includes(d.kind)
+                              : ["area", "goal", "project", "note"].includes(
+                                  d.kind,
+                                )),
+                      )
+                      .map((d) => (
+                        <option value={d.id} key={d.id}>
+                          {d.title}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <label>
+                  Due
+                  <input
+                    type="date"
+                    value={document.metadata.due ?? ""}
+                    onChange={(e) =>
+                      updateMetadata(document.id, {
+                        due: e.target.value || null,
+                      }).catch((e) => notify(e.message))
+                    }
+                  />
+                </label>
+                <code>{document.path}</code>
+                <button
+                  className="text-button"
+                  onClick={() =>
+                    setRename({ id: document.id, path: document.path })
                   }
                 >
-                  {statuses.map((s) => (
-                    <option value={s} key={s}>
-                      {statusLabels[s]}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  Rename file
+                </button>
+                {document.diagnostics.map((d, i) => (
+                  <p className="form-error" key={i}>
+                    {d}
+                  </p>
+                ))}
+              </div>
             )}
-            <label>
-              {document.kind === "project" ? "Area" : "Parent"}
-              <select
-                value={
-                  document.kind === "project"
-                    ? (areaFor(document, vault?.documents ?? [])?.id ?? "")
-                    : (document.metadata.parent ?? "")
-                }
-                onChange={async (e) => {
-                  const parent = e.target.value || null;
-                  try {
-                    if (await updateMetadata(document.id, { parent })) {
-                      const state = await api.request("vault.state", undefined);
-                      if (state) receive(state);
-                      await openDocument(document.id);
-                      setProperties(true);
-                    }
-                  } catch (error: any) {
-                    notify(error.message);
-                  }
-                }}
-              >
-                <option value="" disabled={document.kind === "project"}>
-                  {document.kind === "project" ? "Choose an area" : "No parent"}
-                </option>
-                {vault?.documents
-                  .filter(
-                    (d) =>
-                      d.id !== document.id &&
-                      (document.kind === "project"
-                        ? d.kind === "area"
-                        : document.kind === "goal"
-                          ? ["area", "goal"].includes(d.kind)
-                          : ["area", "goal", "project", "note"].includes(
-                              d.kind,
-                            )),
-                  )
-                  .map((d) => (
-                    <option value={d.id} key={d.id}>
-                      {d.title}
-                    </option>
-                  ))}
-              </select>
-            </label>
-            <label>
-              Due
-              <input
-                type="date"
-                value={document.metadata.due ?? ""}
-                onChange={(e) =>
-                  updateMetadata(document.id, {
-                    due: e.target.value || null,
-                  }).catch((e) => notify(e.message))
+            {document.kind === "project" && (
+              <ProjectPages
+                project={document}
+                documents={areaDocuments}
+                onOpen={openDocument}
+                onCreate={() =>
+                  setCreate({
+                    kind: "note",
+                    parent: document.id,
+                    projectId: document.id,
+                  })
                 }
               />
-            </label>
-            <code>{document.path}</code>
-            <button
-              className="text-button"
-              onClick={() =>
-                setRename({ id: document.id, path: document.path })
-              }
-            >
-              Rename file
-            </button>
-            {document.diagnostics.map((d, i) => (
-              <p className="form-error" key={i}>
-                {d}
-              </p>
-            ))}
+            )}
+            <MarkdownEditor
+              key={current!.id}
+              ref={editor}
+              document={document}
+              missing={!currentDocument}
+              source={source}
+              onFormattingChange={setFormatting}
+              onStatus={setSaveStatus}
+              onError={notify}
+              onConflictCopy={async (raw) => {
+                try {
+                  const title = `${document.title.slice(0, 175)} (preserved draft)`;
+                  const copy = await api.request("documents.preserveDraft", {
+                    title,
+                    raw,
+                  });
+                  editor.current?.acceptPreservedDraft();
+                  receive((await api.request("vault.state", undefined))!);
+                  await navigate({
+                    id: `doc:${copy.id}`,
+                    title: copy.title,
+                    documentId: copy.id,
+                    path: copy.path,
+                  });
+                  notify(`Draft saved in ${copy.path}`);
+                } catch (e: any) {
+                  notify(e.message);
+                }
+              }}
+            />
           </div>
-        )}
-        {document.kind === "project" && (
-          <ProjectPages
-            project={document}
-            documents={areaDocuments}
-            onOpen={openDocument}
-            onCreate={() =>
-              setCreate({
-                kind: "note",
-                parent: document.id,
-                projectId: document.id,
-              })
-            }
-          />
-        )}
-        <MarkdownEditor
-          key={current!.id}
-          ref={editor}
-          document={document}
-          missing={!currentDocument}
-          source={source}
-          onStatus={setSaveStatus}
-          onError={notify}
-          onConflictCopy={async (raw) => {
-            try {
-              const title = `${document.title.slice(0, 175)} (preserved draft)`;
-              const copy = await api.request("documents.preserveDraft", {
-                title,
-                raw,
-              });
-              editor.current?.acceptPreservedDraft();
-              receive((await api.request("vault.state", undefined))!);
-              await navigate({
-                id: `doc:${copy.id}`,
-                title: copy.title,
-                documentId: copy.id,
-                path: copy.path,
-              });
-              notify(`Draft saved in ${copy.path}`);
-            } catch (e: any) {
-              notify(e.message);
-            }
-          }}
-        />
+          {insertOpen && (
+            <DocumentInsertPanel
+              editor={editor}
+              document={document}
+              documents={areaDocuments}
+              onAttach={attachFile}
+            />
+          )}
+        </div>
       </section>
     );
   else if (current?.documentId)
@@ -872,23 +1017,24 @@ export function App() {
         Use search to find it, or open another note.
       </EmptyState>
     );
-  else if (activeView === "projects")
+  else if (activeView === "tasks")
     content = (
-      <ProjectsView
-        {...shared}
-        hiddenColumns={hiddenColumns}
-        onColumns={(columns) => saveViews(pinned, columns)}
-        move={async (id, status, parent) => {
-          await updateMetadata(id, {
-            status,
-            parent: parent ?? (areaId === UNASSIGNED_AREA ? null : areaId),
+      <TaskBoard
+        documents={areaDocuments}
+        open={openDocument}
+        create={(status, parent) => setCreate({ kind: "task", status, parent })}
+        update={async (task, values) => {
+          await api.request("tasks.update", {
+            documentId: task.documentId,
+            taskId: task.id,
+            baseRevision: task.baseRevision,
+            ...values,
           });
-          notify(`Project moved to ${statusLabels[status]}`, true);
+          receive((await api.request("vault.state", undefined))!);
         }}
+        error={notify}
       />
     );
-  else if (activeView === "tasks")
-    content = <TasksView {...shared} toggle={toggle} />;
   else if (activeView === "goals") content = <GoalsView {...shared} />;
   else if (activeView === "areas") content = <NotesView {...shared} areas />;
   else if (activeView === "insights") content = <InsightsView {...shared} />;
@@ -1090,7 +1236,10 @@ export function App() {
             mode={bookmarks ? "bookmarks" : folders ? "files" : "projects"}
             onArea={(id) => void selectArea(id)}
             onOpen={openDocument}
-            onProjects={() => navigateView("projects")}
+            onBrowse={() => setBookmarks(false)}
+            tasksActive={activeView === "tasks"}
+            onTasks={() => navigateView("tasks")}
+            onNewTask={() => setCreate({ kind: "task" })}
             onNewArea={() => setCreate({ kind: "area" })}
             onNewProject={() =>
               setCreate({
@@ -1113,8 +1262,73 @@ export function App() {
               setNewFolder({ parentId, directory })
             }
             onEdit={async (id) => {
-              if (await openDocument(id)) setProperties(true);
+              try {
+                const target = vaultRef.current?.documents.find(
+                  (doc) => doc.id === id,
+                );
+                if (target?.kind === "project") {
+                  if (editor.current && !(await editor.current.flush()))
+                    throw new Error(
+                      "Save or preserve the current draft before editing a project.",
+                    );
+                  const latest = await api.request("vault.state", undefined);
+                  if (latest) receive(latest);
+                  const project = latest?.documents.find(
+                    (doc) => doc.id === id,
+                  );
+                  if (!project)
+                    throw new Error("This project is no longer available.");
+                  setEditingProject(project);
+                } else if (await openDocument(id)) setProperties(true);
+              } catch (error) {
+                notify(
+                  error instanceof Error
+                    ? error.message
+                    : "Could not open this project.",
+                );
+              }
             }}
+            canReveal={!!window.fable}
+            onReveal={async (target) => {
+              await api.request("documents.reveal", target);
+            }}
+            onCopyPath={async (relative) => {
+              if (!vaultRef.current)
+                throw new Error("This workspace is no longer available.");
+              const path = `${vaultRef.current.path}/${relative}`;
+              await (api.copyText
+                ? api.copyText(path)
+                : navigator.clipboard.writeText(path));
+              notify("Path copied");
+            }}
+            onMoveProject={async (id, targetAreaId) => {
+              if (!(await updateMetadata(id, { parent: targetAreaId }))) return;
+              receive((await api.request("vault.state", undefined))!);
+              await selectArea(targetAreaId);
+              notify("Project moved", true);
+            }}
+            onDeleteDocument={deleteDocument}
+            onDeleteFolder={async (parentId, directory) => {
+              if (editor.current && !(await editor.current.flush()))
+                throw new Error(
+                  "Save or preserve the current draft before deleting.",
+                );
+              const state = await api.request("vault.state", undefined);
+              const parent = state?.documents.find(
+                (doc) => doc.id === parentId,
+              );
+              if (!parent)
+                throw new Error("This project or area is no longer available.");
+              receiveDeletion(
+                await api.request("folders.delete", {
+                  parentId,
+                  directory,
+                  baseRevision: parent.revision,
+                }),
+                "Folder",
+              );
+            }}
+            onError={notify}
             onPin={(id) =>
               void saveViews(
                 pinned.includes(id)
@@ -1211,114 +1425,16 @@ export function App() {
       />
       <div className="main-and-panel">
         <div className="main-workspace">
-          <div className="view-toolbar">
-            <div className="history-controls">
-              {sidebarHidden && (
-                <IconButton
-                  icon="sidebar"
-                  label="Show sidebar"
-                  onClick={() => setSidebarHidden(false)}
-                />
-              )}
-              <IconButton
-                icon="left"
-                label="Back"
-                disabled={position.current <= 0}
-                size={17}
-                onClick={() => goHistory(-1)}
-              />
-              <IconButton
-                icon="right"
-                label="Forward"
-                disabled={position.current >= history.current.length - 1}
-                size={17}
-                onClick={() => goHistory(1)}
-              />
+          {!document && (
+            <div className="view-toolbar">
+              {historyControls}
+              <span className="toolbar-title">{title}</span>
+              {pageOptions}
             </div>
-            <span className="toolbar-title">{title}</span>
-            <div className="overflow-anchor">
-              <IconButton
-                icon="more"
-                label="Page options"
-                size={18}
-                onClick={() => setMore(!more)}
-              />
-              {more && (
-                <div className="overflow-menu">
-                  <button
-                    onClick={() => {
-                      setMore(false);
-                      setCreate(
-                        currentProject
-                          ? {
-                              kind: "note",
-                              parent: currentProject.id,
-                              projectId: currentProject.id,
-                            }
-                          : { kind: document?.kind ?? "note" },
-                      );
-                    }}
-                  >
-                    <Icon name="add" size={15} />
-                    New {currentProject ? "page" : (document?.kind ?? "note")}
-                  </button>
-                  <button
-                    onClick={() => {
-                      setMore(false);
-                      setAiOpen(true);
-                    }}
-                  >
-                    <Icon name="ai" size={15} />
-                    Ask your assistant
-                  </button>
-                  {document && (
-                    <>
-                      <button
-                        onClick={() => {
-                          setMore(false);
-                          setSource(!source);
-                        }}
-                      >
-                        <Icon name="code" size={15} />
-                        Toggle Markdown source
-                      </button>
-                      <button
-                        onClick={async () => {
-                          setMore(false);
-                          try {
-                            if (!(await editor.current?.flush())) return;
-                            await api.request("documents.trash", {
-                              id: document.id,
-                              baseRevision: document.revision,
-                            });
-                            await closeTab(active);
-                            notify("File moved to local history", true);
-                          } catch (e: any) {
-                            notify(e.message);
-                          }
-                        }}
-                      >
-                        <Icon name="trash" size={15} />
-                        Move to history
-                      </button>
-                    </>
-                  )}
-                  <button
-                    onClick={() => {
-                      setMore(false);
-                      setSettings("history");
-                    }}
-                  >
-                    <Icon name="waiting" size={15} />
-                    Local history
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
+          )}
           <main
             id="main-content"
-            className={`main-content ${activeView === "projects" ? "board-main" : ""}`}
+            className={`main-content ${document ? "document-main" : ""} ${activeView === "tasks" ? "board-main" : ""}`}
             key={current?.id}
           >
             {content}
@@ -1394,25 +1510,53 @@ export function App() {
           }}
         />
       )}
-      {create && (
+      {create?.kind === "project" && (
+        <ProjectDialog
+          directories={vault.directories ?? []}
+          workspacePath={vault.path}
+          parent={
+            create.parent ??
+            (areaId === UNASSIGNED_AREA ? areas[0]?.id : areaId)
+          }
+          onClose={() => setCreate(null)}
+          beforeSave={async () => {
+            if (editor.current && !(await editor.current.flush()))
+              throw new Error(
+                "Save or preserve the current draft before creating a project.",
+              );
+          }}
+          onSaved={async (project) => {
+            const state = await api.request("vault.state", undefined);
+            if (state) receive(state);
+            const targetArea = areaFor(project, state?.documents ?? [])?.id;
+            if (targetArea && targetArea !== areaIdRef.current)
+              await selectArea(targetArea);
+            await navigate({
+              id: `doc:${project.id}`,
+              title: project.title,
+              documentId: project.id,
+              path: project.path,
+            });
+            setCreate(null);
+            notify("Project created", true);
+          }}
+        />
+      )}
+      {create && create.kind !== "project" && (
         <CreateDialog
           {...create}
           asPage={!!create.projectId}
           parent={
             create.parent ??
-            (create.kind === "area"
+            (create.kind === "area" || create.kind === "task"
               ? undefined
               : areaId === UNASSIGNED_AREA
                 ? undefined
                 : areaId)
           }
-          documents={
-            create.kind === "area" || create.kind === "project"
-              ? vault.documents
-              : areaDocuments
-          }
+          documents={create.kind === "area" ? vault.documents : areaDocuments}
           onClose={() => setCreate(null)}
-          onCreate={async (title, parent) => {
+          onCreate={async (title, parent, taskStatus) => {
             if (editor.current && !(await editor.current.flush()))
               throw new Error("Save or preserve the current draft first.");
             let doc: DocumentSnapshot;
@@ -1420,7 +1564,11 @@ export function App() {
               doc = await api.request("tasks.create", {
                 title,
                 documentId: parent || undefined,
+                areaId: areaId === UNASSIGNED_AREA ? undefined : areaId,
+                status: taskStatus,
               });
+              receive((await api.request("vault.state", undefined))!);
+              await navigateView("tasks");
               notify("Task added", true);
             } else {
               doc = create.projectId
@@ -1473,6 +1621,34 @@ export function App() {
             setNewFolder(null);
             notify("Folder created");
           }}
+        />
+      )}
+      {editingProject && (
+        <ProjectDialog
+          key={editingProject.id}
+          project={editingProject}
+          directories={vault.directories ?? []}
+          workspacePath={vault.path}
+          onClose={() => setEditingProject(null)}
+          beforeSave={async () => {
+            if (editor.current && !(await editor.current.flush()))
+              throw new Error(
+                "Save or preserve the current draft before saving this project.",
+              );
+          }}
+          onSaved={(project) => {
+            const state = vaultRef.current;
+            if (state)
+              receive({
+                ...state,
+                documents: state.documents.map((doc) =>
+                  doc.id === project.id ? project : doc,
+                ),
+              });
+            setEditingProject(null);
+            notify("Project saved", true);
+          }}
+          onRemove={() => deleteDocument(editingProject.id)}
         />
       )}
       {rename && (
@@ -1603,15 +1779,20 @@ function CreateDialog({
   asPage?: boolean;
   documents: DocumentSnapshot[];
   onClose: () => void;
-  onCreate: (title: string, parent?: string) => Promise<void>;
+  onCreate: (
+    title: string,
+    parent?: string,
+    status?: WorkStatus,
+  ) => Promise<void>;
 }) {
   const [title, setTitle] = useState(""),
     [selectedParent, setSelectedParent] = useState(parent ?? ""),
+    [taskStatus, setTaskStatus] = useState<WorkStatus>(status ?? "todo"),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
   const candidates = documents.filter((d) =>
     kind === "task"
-      ? ["project", "note"].includes(d.kind)
+      ? d.kind === "project"
       : kind === "project"
         ? d.kind === "area"
         : kind === "goal"
@@ -1622,9 +1803,7 @@ function CreateDialog({
   );
   return (
     <Modal
-      title={
-        asPage ? "New page" : kind === "task" ? "Capture a task" : `New ${kind}`
-      }
+      title={asPage ? "New page" : kind === "task" ? "New task" : `New ${kind}`}
       onClose={onClose}
     >
       <form
@@ -1634,7 +1813,11 @@ function CreateDialog({
           if (!title.trim()) return;
           setBusy(true);
           try {
-            await onCreate(title.trim(), selectedParent || undefined);
+            await onCreate(
+              title.trim(),
+              selectedParent || undefined,
+              kind === "task" ? taskStatus : undefined,
+            );
           } catch (e: any) {
             setError(e.message);
             setBusy(false);
@@ -1665,21 +1848,22 @@ function CreateDialog({
             {documents.find((project) => project.id === parent)?.title}
           </p>
         )}
-        {!asPage && candidates.length > 0 && (
+        {!asPage && (candidates.length > 0 || kind === "task") && (
           <label className="field-label">
             {kind === "task"
-              ? "Save in"
+              ? "Project"
               : kind === "project"
                 ? "Area"
                 : "Parent"}
             <select
               value={selectedParent}
+              aria-label={kind === "task" ? "Project" : undefined}
               required={kind === "project"}
               disabled={!!directory}
               onChange={(e) => setSelectedParent(e.target.value)}
             >
               <option value="" disabled={kind === "project"}>
-                {kind === "task" ? "Inbox" : "No parent"}
+                {kind === "task" ? "No project" : "No parent"}
               </option>
               {candidates.map((d) => (
                 <option key={d.id} value={d.id}>
@@ -1695,7 +1879,25 @@ function CreateDialog({
             Create an area first to give this project a home.
           </p>
         )}
-        {status && (
+        {kind === "task" && (
+          <label className="field-label">
+            Status
+            <select
+              value={taskStatus}
+              aria-label="Status"
+              onChange={(event) =>
+                setTaskStatus(event.target.value as WorkStatus)
+              }
+            >
+              {statuses.map((value) => (
+                <option key={value} value={value}>
+                  {statusLabels[value]}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {status && kind !== "task" && (
           <p className="field-hint">Starts in {statusLabels[status]}.</p>
         )}
         {error && (

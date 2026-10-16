@@ -11,8 +11,29 @@ export const kinds = [
 export const statuses = ["todo", "waiting", "ready", "doing", "done"] as const;
 export type DocumentKind = (typeof kinds)[number];
 export type WorkStatus = (typeof statuses)[number];
+export const projectFileSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  path: z.string().regex(/^Attachments\/[^/\\]+$/),
+  size: z
+    .number()
+    .int()
+    .min(0)
+    .max(50 * 1024 * 1024),
+});
+export type ProjectFile = z.infer<typeof projectFileSchema>;
+export const projectSettingsSchema = z.object({
+  title: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .regex(/^[^\r\n\u0000-\u001f]+$/),
+  sourceFolders: z.array(z.string().min(1).max(1000)).max(100),
+  files: z.array(projectFileSchema).max(100),
+});
+export type ProjectSettings = z.infer<typeof projectSettingsSchema>;
 export type ViewId =
-  "areas" | "goals" | "projects" | "tasks" | "insights" | "completed" | "notes";
+  "areas" | "goals" | "tasks" | "insights" | "completed" | "notes";
 export const metadataSchema = z
   .object({
     schema: z.literal(1).default(1),
@@ -51,6 +72,8 @@ export interface TaskRef {
   context?: string;
   due?: string;
   status: WorkStatus;
+  /** Undefined inherits the source project; null explicitly removes assignment. */
+  projectId?: string | null;
   completedAt?: string;
   baseRevision: string;
 }
@@ -208,8 +231,20 @@ export interface Operations {
     };
     output: DocumentSnapshot;
   };
+  "projects.update": {
+    input: ProjectSettings & { id: string; baseRevision: string };
+    output: DocumentSnapshot;
+  };
+  "projects.create": {
+    input: ProjectSettings & { parent: string };
+    output: DocumentSnapshot;
+  };
   "folders.create": {
     input: { parentId: string; name: string; directory?: string };
+    output: VaultState;
+  };
+  "folders.delete": {
+    input: { parentId: string; directory: string; baseRevision: string };
     output: VaultState;
   };
   "pages.create": {
@@ -250,7 +285,7 @@ export interface Operations {
     input: { id: string; baseRevision: string };
     output: VaultState;
   };
-  "documents.reveal": { input: { id?: string }; output: void };
+  "documents.reveal": { input: { id?: string; path?: string }; output: void };
   "attachments.add": {
     input: { name?: string; data?: string };
     output: string | null;
@@ -266,7 +301,22 @@ export interface Operations {
     output: DocumentSnapshot;
   };
   "tasks.create": {
-    input: { title: string; documentId?: string };
+    input: {
+      title: string;
+      documentId?: string;
+      areaId?: string;
+      status?: WorkStatus;
+    };
+    output: DocumentSnapshot;
+  };
+  "tasks.update": {
+    input: {
+      documentId: string;
+      taskId: string;
+      baseRevision: string;
+      status?: WorkStatus;
+      projectId?: string | null;
+    };
     output: DocumentSnapshot;
   };
   "tasks.move": {

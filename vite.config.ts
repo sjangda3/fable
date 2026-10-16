@@ -121,7 +121,7 @@ function localPreview(): Plugin {
           const { operation, args } = JSON.parse(body);
           const result = await app.request(operation as Operation, args);
           const state =
-            /^(documents\.(create|save|metadata|rename|trash|preserveDraft)|tasks\.|changes\.apply|history\.undo)/.test(
+            /^(documents\.(create|save|metadata|rename|trash|preserveDraft)|projects\.(create|update)|tasks\.|changes\.apply|history\.undo)/.test(
               operation,
             )
               ? app.vault.state

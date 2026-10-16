@@ -71,6 +71,19 @@ export function pagesFor(projectId: string, documents: DocumentSnapshot[]) {
       projectFor(document, lookup)?.id === projectId,
   );
 }
+export function taskProjectFor(
+  task: TaskRef,
+  document: DocumentSnapshot,
+  documents: DocumentSnapshot[] | Map<string, DocumentSnapshot>,
+) {
+  if (task.projectId === undefined) return projectFor(document, documents);
+  if (task.projectId === null) return undefined;
+  const project =
+    documents instanceof Map
+      ? documents.get(task.projectId)
+      : documents.find((d) => d.id === task.projectId);
+  return project?.kind === "project" ? project : undefined;
+}
 export function taskGroups(documents: DocumentSnapshot[], completed = false) {
   const groups = new Map<
     string,
@@ -79,17 +92,9 @@ export function taskGroups(documents: DocumentSnapshot[], completed = false) {
   const byId = new Map(documents.map((d) => [d.id, d])),
     order = new Map(documents.map((d, i) => [d.id, i]));
   for (const document of documents) {
-    let project: DocumentSnapshot | undefined = document;
-    const seen = new Set<string>();
-    while (project && project.kind !== "project" && !seen.has(project.id)) {
-      seen.add(project.id);
-      project = project.metadata.parent
-        ? byId.get(project.metadata.parent)
-        : undefined;
-    }
-    if (project?.kind !== "project") project = undefined;
     for (const task of document.tasks) {
       if (task.done !== completed) continue;
+      const project = taskProjectFor(task, document, byId);
       const id = project?.id ?? "unassigned";
       if (!groups.has(id))
         groups.set(id, {

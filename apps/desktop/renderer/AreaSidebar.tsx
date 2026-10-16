@@ -36,6 +36,7 @@ import {
 import { useSidebarDrag } from "./useSidebarDrag.tsx";
 import type { SidebarItem } from "./sidebar-drag.ts";
 import { MovePageDialog } from "./MovePageDialog.tsx";
+import { DropdownMenu, type DropdownEntry } from "./DropdownMenu.tsx";
 
 type Props = {
   areas: DocumentSnapshot[];
@@ -54,7 +55,10 @@ type Props = {
   mode: "projects" | "files" | "bookmarks";
   onArea: (id: string) => void;
   onOpen: (id: string) => void;
-  onProjects: () => void;
+  onBrowse: () => void;
+  tasksActive: boolean;
+  onTasks: () => void;
+  onNewTask: () => void;
   onNewArea: () => void;
   onNewProject: () => void;
   onNewNote: (parentId: string, directory?: string) => void;
@@ -62,8 +66,25 @@ type Props = {
   onNewFolder: (parentId: string, directory?: string) => void;
   onEdit: (id: string) => void;
   onPin: (id: string) => void;
+  onCopyPath: (path: string) => Promise<void>;
+  onReveal: (target: { id?: string; path?: string }) => Promise<void>;
+  canReveal: boolean;
+  onMoveProject: (id: string, areaId: string) => Promise<void>;
+  onDeleteDocument: (id: string) => Promise<void>;
+  onDeleteFolder: (parentId: string, directory: string) => Promise<void>;
+  onError: (message: string) => void;
 };
 type Hover = { project: DocumentSnapshot; top: number; left: number };
+type ItemMenuTarget =
+  | { kind: "file"; document: DocumentSnapshot }
+  | {
+      kind: "folder";
+      parentId: string;
+      directory: string;
+      title: string;
+      toggleKey: string;
+      expanded: boolean;
+    };
 const notesOnly = (d: DocumentSnapshot) =>
   ["note", "conversation", "insight"].includes(d.kind);
 
@@ -122,7 +143,10 @@ export function AreaSidebar(props: Props) {
     mode,
     onArea,
     onOpen,
-    onProjects,
+    onBrowse,
+    tasksActive,
+    onTasks,
+    onNewTask,
     onNewArea,
     onNewProject,
     onNewNote,
@@ -130,6 +154,13 @@ export function AreaSidebar(props: Props) {
     onNewFolder,
     onEdit,
     onPin,
+    onCopyPath,
+    onReveal,
+    canReveal,
+    onMoveProject,
+    onDeleteDocument,
+    onDeleteFolder,
+    onError,
   } = props;
   const reduced = useReducedMotion(),
     id = useId(),
@@ -160,6 +191,18 @@ export function AreaSidebar(props: Props) {
     }),
     [allNotes, setAllNotes] = useState<Set<string>>(new Set());
   const [movingPage, setMovingPage] = useState<DocumentSnapshot | null>(null);
+  const [projectMenu, setProjectMenu] = useState<{
+    project: DocumentSnapshot;
+    left: number;
+    top: number;
+    trigger: HTMLElement;
+  } | null>(null);
+  const [itemMenu, setItemMenu] = useState<{
+    target: ItemMenuTarget;
+    left: number;
+    top: number;
+    trigger: HTMLElement;
+  } | null>(null);
   const drag = useSidebarDrag({
     onReorder,
     onMovePage,
@@ -172,7 +215,6 @@ export function AreaSidebar(props: Props) {
       }),
   });
   const switcher = useRef<HTMLButtonElement>(null),
-    menuRef = useRef<HTMLDivElement>(null),
     revealedNote = useRef<string | undefined>(undefined),
     hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const area = areas.find((a) => a.id === areaId),
@@ -215,7 +257,7 @@ export function AreaSidebar(props: Props) {
     hoverTimer.current = setTimeout(() => setHover(null), 140);
   };
   const showHover = (project: DocumentSnapshot, element: HTMLElement) => {
-    if (drag.active || drag.busy) return;
+    if (drag.active || drag.busy || menu || projectMenu || itemMenu) return;
     clearTimeout(hoverTimer.current);
     const rect = element.getBoundingClientRect();
     hoverTimer.current = setTimeout(
@@ -232,6 +274,8 @@ export function AreaSidebar(props: Props) {
   useEffect(() => {
     setHover(null);
     setMenu(null);
+    setProjectMenu(null);
+    setItemMenu(null);
     drag.reset();
     setMovingPage(null);
   }, [areaId, mode]);
@@ -239,6 +283,8 @@ export function AreaSidebar(props: Props) {
     if (!drag.active) return;
     clearTimeout(hoverTimer.current);
     setHover(null);
+    setProjectMenu(null);
+    setItemMenu(null);
     setAllNotes(new Set(grouped.projects.map((project) => project.id)));
   }, [drag.active]);
   useEffect(() => {
@@ -283,46 +329,128 @@ export function AreaSidebar(props: Props) {
     }
   }, [activeId, grouped, areaId]);
   useEffect(() => {
-    if (!menu) return;
-    const frame = requestAnimationFrame(() =>
-      menuRef.current
-        ?.querySelector<HTMLButtonElement>('[aria-checked="true"]')
-        ?.focus(),
-    );
-    return () => cancelAnimationFrame(frame);
-  }, [menu]);
-  useEffect(() => {
-    const dismiss = (event: PointerEvent) => {
-      if (
-        !menuRef.current?.contains(event.target as Node) &&
-        !switcher.current?.contains(event.target as Node)
-      )
-        setMenu(null);
-    };
     const key = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        if (menuRef.current) switcher.current?.focus();
-        setMenu(null);
         setHover(null);
         clearTimeout(hoverTimer.current);
       }
     };
     const moved = () => {
-      setMenu(null);
       setHover(null);
       clearTimeout(hoverTimer.current);
     };
-    document.addEventListener("pointerdown", dismiss);
     document.addEventListener("keydown", key);
     window.addEventListener("resize", moved);
     window.addEventListener("fable:sidebar-scroll", moved);
     return () => {
-      document.removeEventListener("pointerdown", dismiss);
       document.removeEventListener("keydown", key);
       window.removeEventListener("resize", moved);
       window.removeEventListener("fable:sidebar-scroll", moved);
     };
   }, []);
+  const openProjectMenu = (
+    project: DocumentSnapshot,
+    trigger: HTMLElement,
+    left: number,
+    top: number,
+  ) => {
+    clearTimeout(hoverTimer.current);
+    setHover(null);
+    setMenu(null);
+    setItemMenu(null);
+    setProjectMenu({ project, trigger, left, top });
+  };
+  const openItemMenu = (
+    target: ItemMenuTarget,
+    trigger: HTMLElement,
+    left: number,
+    top: number,
+  ) => {
+    clearTimeout(hoverTimer.current);
+    setHover(null);
+    setMenu(null);
+    setProjectMenu(null);
+    setItemMenu({ target, trigger, left, top });
+  };
+  const projectMenuItems = (project: DocumentSnapshot): DropdownEntry[] => [
+    {
+      id: "open",
+      label: "Open project",
+      icon: "folderOpen",
+      onSelect: () => onOpen(project.id),
+    },
+    {
+      id: "finder",
+      label: "Show in Finder",
+      icon: "folder",
+      disabled: !canReveal,
+      hint: canReveal ? undefined : "Available in the desktop app",
+      onSelect: () => onReveal({ id: project.id }),
+    },
+    {
+      id: "copy",
+      label: "Copy path",
+      icon: "copy",
+      onSelect: () => onCopyPath(project.path),
+    },
+    { separator: true },
+    {
+      id: "page",
+      label: "New page",
+      icon: "fileAdd",
+      onSelect: () => onNewPage(project.id),
+    },
+    {
+      id: "folder",
+      label: "New folder",
+      icon: "folderAdd",
+      onSelect: () => onNewFolder(project.id),
+    },
+    { separator: true },
+    {
+      id: "move",
+      label: "Move to area",
+      icon: "areas",
+      children: [
+        ...areas.map((option) => ({
+          id: option.id,
+          label: option.title,
+          icon: "areas" as const,
+          checked: areaId === option.id,
+          onSelect: () =>
+            option.id === areaId
+              ? undefined
+              : onMoveProject(project.id, option.id),
+        })),
+        { separator: true },
+        {
+          id: "new-area",
+          label: "New area…",
+          icon: "add",
+          onSelect: onNewArea,
+        },
+      ],
+    },
+    {
+      id: "edit",
+      label: "Edit project",
+      icon: "edit",
+      onSelect: () => onEdit(project.id),
+    },
+    {
+      id: "pin",
+      label: pinned.includes(project.id) ? "Unpin project" : "Pin project",
+      icon: "pin",
+      onSelect: () => onPin(project.id),
+    },
+    { separator: true },
+    {
+      id: "delete",
+      label: "Delete",
+      icon: "trash",
+      onSelect: () => onDeleteDocument(project.id),
+    },
+  ];
   const toggle = (key: string) => {
     clearTimeout(hoverTimer.current);
     setHover(null);
@@ -332,6 +460,101 @@ export function AreaSidebar(props: Props) {
       else next.add(key);
       return next;
     });
+  };
+  const itemMenuItems = (target: ItemMenuTarget): DropdownEntry[] => {
+    const relative =
+      target.kind === "file" ? target.document.path : target.directory;
+    const common: DropdownEntry[] = [
+      {
+        id: "finder",
+        label: "Show in Finder",
+        icon: "folder",
+        disabled: !canReveal,
+        hint: canReveal ? undefined : "Available in the desktop app",
+        onSelect: () => onReveal({ path: relative }),
+      },
+      {
+        id: "copy",
+        label: "Copy path",
+        icon: "copy",
+        onSelect: () => onCopyPath(relative),
+      },
+    ];
+    if (target.kind === "folder")
+      return [
+        {
+          id: "toggle",
+          label: target.expanded ? "Collapse folder" : "Expand folder",
+          icon: target.expanded ? "folder" : "folderOpen",
+          onSelect: () => toggle(target.toggleKey),
+        },
+        ...common,
+        { separator: true },
+        {
+          id: "page",
+          label: grouped.projects.some((p) => p.id === target.parentId)
+            ? "New page"
+            : "New note",
+          icon: "fileAdd",
+          onSelect: () =>
+            grouped.projects.some((p) => p.id === target.parentId)
+              ? onNewPage(target.parentId, target.directory)
+              : onNewNote(target.parentId, target.directory),
+        },
+        {
+          id: "folder",
+          label: "New folder",
+          icon: "folderAdd",
+          onSelect: () => onNewFolder(target.parentId, target.directory),
+        },
+        { separator: true },
+        {
+          id: "delete",
+          label: "Delete",
+          icon: "trash",
+          onSelect: () => onDeleteFolder(target.parentId, target.directory),
+        },
+      ];
+    const file = target.document;
+    return [
+      {
+        id: "open",
+        label: "Open file",
+        icon: "page",
+        onSelect: () => onOpen(file.id),
+      },
+      ...common,
+      { separator: true },
+      ...(file.kind === "note"
+        ? [
+            {
+              id: "move",
+              label: "Move to…",
+              icon: "folderOpen" as const,
+              onSelect: () => setMovingPage(file),
+            },
+          ]
+        : []),
+      {
+        id: "edit",
+        label: "Edit properties",
+        icon: "edit",
+        onSelect: () => onEdit(file.id),
+      },
+      {
+        id: "pin",
+        label: pinned.includes(file.id) ? "Unpin file" : "Pin file",
+        icon: "pin",
+        onSelect: () => onPin(file.id),
+      },
+      { separator: true },
+      {
+        id: "delete",
+        label: "Delete",
+        icon: "trash",
+        onSelect: () => onDeleteDocument(file.id),
+      },
+    ];
   };
   const selection = (key: string) =>
     activeId === key && (
@@ -404,6 +627,20 @@ export function AreaSidebar(props: Props) {
             title={note.title}
             aria-describedby={draggable ? `${id}-drag-help` : undefined}
             onKeyDown={(event) => {
+              if (
+                event.key === "ContextMenu" ||
+                (event.shiftKey && event.key === "F10")
+              ) {
+                event.preventDefault();
+                const rect = event.currentTarget.getBoundingClientRect();
+                openItemMenu(
+                  { kind: "file", document: note },
+                  event.currentTarget,
+                  rect.left + 24,
+                  rect.bottom + 4,
+                );
+                return;
+              }
               if (!draggable) return;
               if (event.altKey && event.key.toLowerCase() === "m") {
                 event.preventDefault();
@@ -415,14 +652,16 @@ export function AreaSidebar(props: Props) {
                   siblings.filter((n) => n.kind === "note").map(pageItem),
                 );
             }}
-            onContextMenu={
-              draggable
-                ? (event) => {
-                    event.preventDefault();
-                    setMovingPage(note);
-                  }
-                : undefined
-            }
+            aria-keyshortcuts="Shift+F10"
+            onContextMenu={(event) => {
+              event.preventDefault();
+              openItemMenu(
+                { kind: "file", document: note },
+                event.currentTarget,
+                event.clientX,
+                event.clientY,
+              );
+            }}
           >
             <Icon
               name={
@@ -442,9 +681,17 @@ export function AreaSidebar(props: Props) {
                 variant="plain"
                 icon="more"
                 size={15}
-                label={`Move ${note.title}`}
+                label={`Actions for ${note.title}`}
                 disabled={drag.busy}
-                onClick={() => setMovingPage(note)}
+                onClick={(event) => {
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  openItemMenu(
+                    { kind: "file", document: note },
+                    event.currentTarget,
+                    rect.left,
+                    rect.bottom + 4,
+                  );
+                }}
               />
             </span>
           )}
@@ -540,6 +787,24 @@ export function AreaSidebar(props: Props) {
                     className="area-folder-row"
                     style={{ "--note-depth": depth } as React.CSSProperties}
                     {...drag.bind(item, key)}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      openItemMenu(
+                        {
+                          kind: "folder",
+                          parentId,
+                          directory,
+                          title: item.title,
+                          toggleKey: key,
+                          expanded,
+                        },
+                        event.currentTarget.querySelector<HTMLButtonElement>(
+                          "button",
+                        )!,
+                        event.clientX,
+                        event.clientY,
+                      );
+                    }}
                   >
                     {drag.indicator(item)}
                     <button
@@ -548,13 +813,35 @@ export function AreaSidebar(props: Props) {
                       aria-controls={contentsId}
                       aria-describedby={`${id}-drag-help`}
                       onClick={() => toggle(key)}
-                      onKeyDown={(event) =>
-                        drag.keyboard(
-                          event,
-                          item,
-                          siblingFolders.map(folderItem),
-                        )
-                      }
+                      aria-keyshortcuts="Shift+F10"
+                      onKeyDown={(event) => {
+                        if (
+                          event.key === "ContextMenu" ||
+                          (event.shiftKey && event.key === "F10")
+                        ) {
+                          event.preventDefault();
+                          const rect =
+                            event.currentTarget.getBoundingClientRect();
+                          openItemMenu(
+                            {
+                              kind: "folder",
+                              parentId,
+                              directory,
+                              title: item.title,
+                              toggleKey: key,
+                              expanded,
+                            },
+                            event.currentTarget,
+                            rect.left + 24,
+                            rect.bottom + 4,
+                          );
+                        } else
+                          drag.keyboard(
+                            event,
+                            item,
+                            siblingFolders.map(folderItem),
+                          );
+                      }}
                     >
                       <motion.span
                         animate={{ rotate: expanded ? 90 : 0 }}
@@ -615,9 +902,7 @@ export function AreaSidebar(props: Props) {
               .get(project.id)
               ?.some((n) => pinned.includes(n.id)),
         )
-      : grouped.projects.filter(
-          (project) => mode === "files" || project.metadata.status !== "done",
-        );
+      : grouped.projects;
   const hoveredPageCount = hover
     ? (grouped.byProject
         .get(hover.project.id)
@@ -644,7 +929,10 @@ export function AreaSidebar(props: Props) {
             aria-haspopup="menu"
             aria-expanded={!!menu}
             onClick={() => {
+              clearTimeout(hoverTimer.current);
               setHover(null);
+              setProjectMenu(null);
+              setItemMenu(null);
               if (menu) setMenu(null);
               else {
                 const rect = switcher.current!.getBoundingClientRect();
@@ -665,10 +953,35 @@ export function AreaSidebar(props: Props) {
               <Icon name="down" size={14} />
             </motion.span>
           </button>
+          <nav className="area-navigation" aria-label="Area navigation">
+            <div className="area-navigation-row">
+              <button
+                onClick={onTasks}
+                aria-current={tasksActive ? "page" : undefined}
+              >
+                <Icon name="tasks" size={18} />
+                <span>Tasks</span>
+                <span className="area-task-count">
+                  {documents.reduce(
+                    (n, doc) =>
+                      n + doc.tasks.filter((task) => !task.done).length,
+                    0,
+                  )}
+                </span>
+              </button>
+              <IconButton
+                variant="plain"
+                icon="add"
+                size={16}
+                label="New task"
+                onClick={onNewTask}
+              />
+            </div>
+          </nav>
           <div className="area-section-heading">
-            <button onClick={onProjects}>
+            <span className="area-projects-label">
               {mode === "bookmarks" ? "Bookmarks" : "Projects"}
-            </button>
+            </span>
             <IconButton
               variant="plain"
               icon="add"
@@ -724,6 +1037,17 @@ export function AreaSidebar(props: Props) {
                     <div
                       className={`area-project-row ${project.id === activeId ? "is-active" : ""}`}
                       {...drag.bind(item, project.id)}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        openProjectMenu(
+                          project,
+                          event.currentTarget.querySelector<HTMLButtonElement>(
+                            ".area-project-open",
+                          )!,
+                          event.clientX,
+                          event.clientY,
+                        );
+                      }}
                       onMouseEnter={(e) => showHover(project, e.currentTarget)}
                       onMouseLeave={closeHover}
                       onFocus={(e) => {
@@ -749,9 +1073,28 @@ export function AreaSidebar(props: Props) {
                         aria-expanded={expanded}
                         aria-controls={contentsId}
                         aria-describedby={`${id}-drag-help`}
-                        onKeyDown={(event) =>
-                          drag.keyboard(event, item, projects.map(projectItem))
-                        }
+                        aria-keyshortcuts="Shift+F10"
+                        onKeyDown={(event) => {
+                          if (
+                            event.key === "ContextMenu" ||
+                            (event.shiftKey && event.key === "F10")
+                          ) {
+                            event.preventDefault();
+                            const rect =
+                              event.currentTarget.getBoundingClientRect();
+                            openProjectMenu(
+                              project,
+                              event.currentTarget,
+                              rect.left + 24,
+                              rect.bottom + 4,
+                            );
+                          } else
+                            drag.keyboard(
+                              event,
+                              item,
+                              projects.map(projectItem),
+                            );
+                        }}
                       >
                         <motion.span
                           className="area-project-chevron"
@@ -809,14 +1152,6 @@ export function AreaSidebar(props: Props) {
                           id={contentsId}
                         >
                           {tree(visible, documentFolder(project), project.id)}
-                          <button
-                            className="project-new-page"
-                            onClick={() => onNewPage(project.id)}
-                            aria-label={`Add page to ${project.title}`}
-                          >
-                            <Icon name="fileAdd" size={15} />
-                            <span>New page</span>
-                          </button>
                           {notes.length > 5 && (
                             <button
                               className="area-show-more"
@@ -849,12 +1184,10 @@ export function AreaSidebar(props: Props) {
                       : "A little room for your next idea."}
                   </p>
                   <button
-                    onClick={
-                      mode === "bookmarks" ? () => onProjects() : onNewProject
-                    }
+                    onClick={mode === "bookmarks" ? onBrowse : onNewProject}
                   >
                     {mode === "bookmarks"
-                      ? "View projects"
+                      ? "Show all projects"
                       : "Create a project"}
                     <Icon name="add" size={14} />
                   </button>
@@ -925,97 +1258,68 @@ export function AreaSidebar(props: Props) {
               onMove={onMovePage}
             />
           )}
-          {createPortal(
-            <AnimatePresence>
-              {menu && (
-                <motion.div
-                  ref={menuRef}
-                  className="area-menu"
-                  role="menu"
-                  aria-label="Choose an area"
-                  style={menu}
-                  initial={{
-                    opacity: 0,
-                    y: reduced ? 0 : -4,
-                    scale: reduced ? 1 : 0.98,
-                  }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{
-                    opacity: 0,
-                    y: reduced ? 0 : -4,
-                    scale: reduced ? 1 : 0.98,
-                  }}
-                  transition={transition}
-                  onKeyDown={(event) => {
-                    if (
-                      ["ArrowDown", "ArrowUp", "Home", "End"].includes(
-                        event.key,
-                      )
-                    ) {
-                      event.preventDefault();
-                      const buttons = [
-                          ...event.currentTarget.querySelectorAll<HTMLButtonElement>(
-                            "button",
-                          ),
-                        ],
-                        index = buttons.indexOf(
-                          document.activeElement as HTMLButtonElement,
-                        );
-                      buttons[
-                        event.key === "Home"
-                          ? 0
-                          : event.key === "End"
-                            ? buttons.length - 1
-                            : (index +
-                                (event.key === "ArrowDown" ? 1 : -1) +
-                                buttons.length) %
-                              buttons.length
-                      ]?.focus();
-                    }
-                  }}
-                >
-                  {[
-                    ...areas.map((a) => ({ id: a.id, title: a.title })),
+          <AnimatePresence>
+            {menu && (
+              <DropdownMenu
+                key="area-menu"
+                label="Choose an area"
+                anchor={menu}
+                returnFocus={switcher.current}
+                onClose={() => setMenu(null)}
+                onError={onError}
+                items={[
+                  ...[
+                    ...areas.map((option) => ({
+                      id: option.id,
+                      title: option.title,
+                    })),
                     { id: UNASSIGNED_AREA, title: "Unassigned" },
-                  ].map((option) => (
-                    <button
-                      key={option.id}
-                      role="menuitemradio"
-                      aria-checked={areaId === option.id}
-                      onClick={() => {
-                        setMenu(null);
-                        onArea(option.id);
-                      }}
-                    >
-                      <Icon
-                        name={
-                          option.id === UNASSIGNED_AREA ? "folder" : "areas"
-                        }
-                        size={16}
-                      />
-                      <span>{option.title}</span>
-                      {areaId === option.id && <Icon name="check" size={15} />}
-                    </button>
-                  ))}
-                  <div className="area-menu-divider" />
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      setMenu(null);
-                      onNewArea();
-                    }}
-                  >
-                    <Icon name="add" size={16} />
-                    <span>New area</span>
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>,
-            document.body,
-          )}
+                  ].map((option) => ({
+                    id: option.id,
+                    label: option.title,
+                    icon:
+                      option.id === UNASSIGNED_AREA
+                        ? ("folder" as const)
+                        : ("areas" as const),
+                    checked: areaId === option.id,
+                    onSelect: () => onArea(option.id),
+                  })),
+                  { separator: true },
+                  {
+                    id: "new-area",
+                    label: "New area…",
+                    icon: "add",
+                    onSelect: onNewArea,
+                  },
+                ]}
+              />
+            )}
+            {projectMenu && (
+              <DropdownMenu
+                key={`project-menu-${projectMenu.project.id}`}
+                label={`Actions for ${projectMenu.project.title}`}
+                anchor={projectMenu}
+                returnFocus={projectMenu.trigger}
+                onClose={() => setProjectMenu(null)}
+                onError={onError}
+                items={projectMenuItems(projectMenu.project)}
+              />
+            )}
+            {itemMenu && (
+              <DropdownMenu
+                key={`item-menu-${itemMenu.target.kind === "file" ? itemMenu.target.document.id : itemMenu.target.directory}`}
+                label={`Actions for ${itemMenu.target.kind === "file" ? itemMenu.target.document.title : itemMenu.target.title}`}
+                anchor={itemMenu}
+                returnFocus={itemMenu.trigger}
+                onClose={() => setItemMenu(null)}
+                onError={onError}
+                items={itemMenuItems(itemMenu.target)}
+              />
+            )}
+          </AnimatePresence>
           {createPortal(
             <AnimatePresence>
-              {hover && !menu && (
+              {hover && !menu && !projectMenu && !itemMenu && (
                 <motion.aside
                   className="project-hover-card"
                   role="dialog"
