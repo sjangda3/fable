@@ -1044,60 +1044,100 @@
     height: 17px;
   }
   .tab-strip {
+    --icon: #000;
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 6px 12px 6px 16px;
+    padding: 4px 12px;
     min-width: 0;
     overflow: hidden;
+    color: #000;
+  }
+  .page-tabs {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 1 auto;
+    min-width: 0;
+    height: 32px;
+    padding: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    -webkit-app-region: no-drag;
+  }
+  .page-tabs::-webkit-scrollbar {
+    display: none;
   }
   .tab {
+    position: relative;
     height: 28px;
     display: flex;
     align-items: center;
-    border: 1px solid #e8e8e8;
-    border-radius: 6px;
-    min-width: 120px;
-    width: 200px;
-    max-width: 220px;
-    flex-shrink: 1;
-    color: #888;
-    overflow: hidden;
+    border-radius: 8px;
+    max-width: 192px;
+    flex: 0 0 auto;
+    isolation: isolate;
   }
-  .tab.active {
-    background: #eeeeee;
-    border-color: #eeeeee;
-    color: #262626;
+  .tab-selection {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--selected);
+    pointer-events: none;
   }
-  .tab > button:first-child {
+  .tab-trigger {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 8px;
     height: 100%;
-    padding: 0 8px;
+    padding: 0 4px 0 8px;
+    border-radius: inherit;
     flex: 1;
     min-width: 0;
     text-align: left;
     font-size: 12px;
+    line-height: 16px;
+    color: #000;
   }
-  .tab > button:first-child > span {
+  .tab-trigger > span {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .tab > .icon-button {
-    color: inherit;
-    width: 25px;
+    color: #000;
+    width: 24px;
     height: 24px;
+    margin-right: 2px;
     opacity: 0;
   }
   .tab.active > .icon-button,
   .tab:hover > .icon-button,
   .tab:focus-within > .icon-button {
+    opacity: 0.5;
+  }
+  .tab > .icon-button:is(:hover, :focus-visible):not(:disabled) {
     opacity: 1;
   }
-  .tab .icon {
-    color: inherit;
+  .tab > .icon-button:active:not(:disabled) {
+    opacity: 0.65;
+  }
+  .tab-strip > .icon-button {
+    opacity: 0.5;
+  }
+  .tab-strip
+    > .icon-button:is(:hover, :focus-visible, .is-active):not(:disabled) {
+    opacity: 1;
+  }
+  .tab-strip > .icon-button:active:not(:disabled) {
+    opacity: 0.65;
+  }
+  .tab-list-trigger > span {
+    display: flex;
   }
   .titlebar-drag-space {
     flex: 1;
@@ -1115,6 +1155,18 @@
     border-right: 1px solid var(--line);
     overflow: hidden;
     user-select: none;
+  }
+  .sidebar-history {
+    flex-shrink: 0;
+    padding: 4px 12px 0;
+  }
+  .sidebar-history .icon-button {
+    height: 28px;
+    color: #000;
+    border-radius: 8px;
+  }
+  .sidebar-history .icon-button:disabled {
+    opacity: 0.3;
   }
   .sidebar-scroll {
     padding: 12px 12px 20px;
@@ -3230,10 +3282,6 @@
     .main-and-panel:has(.ai-panel) .reading-page {
       width: calc(100% - 48px);
     }
-    .tab {
-      min-width: 110px;
-      max-width: 185px;
-    }
     .outline-page {
       padding-left: 64px;
     }
@@ -3269,14 +3317,8 @@
       z-index: 12;
       box-shadow: -8px 0 30px #00000005;
     }
-    .tab {
-      min-width: 90px;
-    }
     .tab-strip {
       padding-left: 8px;
-    }
-    .tab-strip > .icon-button:nth-last-child(2) {
-      display: none;
     }
     .outline-page {
       padding-left: 32px;

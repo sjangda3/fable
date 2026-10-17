@@ -6,6 +6,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { AnimatePresence } from "framer-motion";
 import { api } from "./api.ts";
 import { resolveVaultLink, relativeVaultHref } from "./links.ts";
 import { Icon, type IconName } from "../../../packages/ui/icons.tsx";
@@ -18,6 +19,7 @@ import {
 } from "../../../packages/domain/index.ts";
 import { AreaSidebar } from "./AreaSidebar.tsx";
 import { ProjectPages } from "./ProjectPages.tsx";
+import { PageTabs } from "./PageTabs.tsx";
 import { ProjectDialog } from "./ProjectDialog.tsx";
 import { TaskBoard } from "./TaskBoard.tsx";
 import {
@@ -35,9 +37,11 @@ import {
 } from "../../../packages/contracts/index.ts";
 import { IconButton, Modal, StatusIcon, EmptyState } from "./components.tsx";
 import { GoalsView, NotesView, InsightsView, CompletedView } from "./Views.tsx";
-import { MarkdownEditor, type EditorHandle } from "./Editor.tsx";
+import type { EditorHandle } from "./Editor.tsx";
+import { MarkdownEditor } from "./NotebookEditor.tsx";
 import { DocumentToolbar, DocumentInsertPanel } from "./DocumentChrome.tsx";
-import { emptyFormatting } from "./editor-commands.ts";
+import { emptyFormatting, type EditorMode } from "./editor-commands.ts";
+import { DocumentCanvas } from "./DocumentCanvas.tsx";
 import {
   AIPanel,
   ChangeReview,
@@ -82,11 +86,13 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(272),
     [sidebarHidden, setSidebarHidden] = useState(false),
     [aiOpen, setAiOpen] = useState(false),
-    [source, setSource] = useState(false),
+    [editorMode, setEditorMode] = useState<EditorMode>("live"),
     [properties, setProperties] = useState(false),
-    [insertOpen, setInsertOpen] = useState(true),
+    [insertOpen, setInsertOpen] = useState(false),
     [formatting, setFormatting] = useState(emptyFormatting),
     [saveStatus, setSaveStatus] = useState("Saved");
+  const source = editorMode === "code";
+  const preview = editorMode === "preview";
   const [palette, setPalette] = useState(false),
     [paletteQuery, setPaletteQuery] = useState(""),
     [create, setCreate] = useState<{
@@ -668,13 +674,6 @@ export function App() {
   };
   const historyControls = (
     <div className="history-controls">
-      {sidebarHidden && (
-        <IconButton
-          icon="sidebar"
-          label="Show sidebar"
-          onClick={() => setSidebarHidden(false)}
-        />
-      )}
       <IconButton
         icon="left"
         label="Back"
@@ -732,7 +731,7 @@ export function App() {
               <button
                 onClick={() => {
                   setMore(false);
-                  setSource(!source);
+                  setEditorMode(source ? "live" : "code");
                 }}
               >
                 <Icon name="code" size={15} />
@@ -769,212 +768,201 @@ export function App() {
   let content: ReactNode;
   if (document)
     content = (
-      <section className="document-page">
+      <section
+        className={`document-page ${insertOpen && !preview ? "is-insert-open" : ""}`}
+      >
         <DocumentToolbar
-          navigation={historyControls}
+          key={document.id}
+          document={document}
           editor={editor}
           formatting={formatting}
-          source={source}
-          onSource={() => setSource(!source)}
+          mode={editorMode}
+          onModeChange={setEditorMode}
+          onError={notify}
           insertOpen={insertOpen}
           onInsert={() => setInsertOpen(!insertOpen)}
         >
-          <span className="save-status" role="status">
-            {saveStatus}
-          </span>
-          <button
-            aria-label="Page properties"
-            title="Page properties"
-            className={`properties-toggle ${properties ? "selected" : ""}`}
-            onClick={() => setProperties(!properties)}
-          >
-            <Icon
-              name={
-                document.kind === "note"
-                  ? isProjectPage
-                    ? "page"
-                    : "note"
-                  : document.kind === "conversation"
+          {!isProjectPage && (
+            <button
+              aria-label="Page properties"
+              title="Page properties"
+              className={`properties-toggle ${properties ? "selected" : ""}`}
+              onClick={() => setProperties(!properties)}
+            >
+              <Icon
+                name={
+                  document.kind === "conversation"
                     ? "ai"
                     : (document.kind as IconName)
-              }
-              size={15}
-            />
-            <span>
-              {isProjectPage
-                ? "Page"
-                : document.kind.charAt(0).toUpperCase() +
-                  document.kind.slice(1)}
-            </span>
-            <Icon name="down" size={12} />
-          </button>
-          <IconButton
-            icon="bookmark"
-            label={
-              pinned.includes(document.id)
-                ? "Remove bookmark"
-                : isProjectPage
-                  ? "Bookmark page"
-                  : "Bookmark note"
-            }
-            className={pinned.includes(document.id) ? "is-pinned" : ""}
-            onClick={() =>
-              saveViews(
-                pinned.includes(document.id)
-                  ? pinned.filter((id) => id !== document.id)
-                  : [...pinned, document.id],
-                hiddenColumns,
-              )
-            }
-          />
-          {pageOptions}
-        </DocumentToolbar>
-        <div
-          className={`document-layout ${insertOpen ? "has-insert-panel" : ""}`}
-        >
-          <div className="document-canvas">
-            {properties && (
-              <div className="properties-panel">
-                <label>
-                  Type
-                  <select
-                    value={document.kind}
-                    onChange={(e) =>
-                      updateMetadata(document.id, {
-                        kind: e.target.value,
-                      }).catch((e) => notify(e.message))
-                    }
-                  >
-                    {kinds
-                      .filter((k) => k !== "conversation")
-                      .map((kind) => (
-                        <option key={kind} value={kind}>
-                          {kind === "note" && isProjectPage
-                            ? "Page"
-                            : kind.charAt(0).toUpperCase() + kind.slice(1)}
-                        </option>
-                      ))}
-                  </select>
-                </label>
-                {document.kind === "goal" && (
-                  <label>
-                    Status
-                    <select
-                      value={document.metadata.status}
-                      onChange={(e) =>
-                        updateMetadata(document.id, {
-                          status: e.target.value,
-                          ...(e.target.value === "done"
-                            ? { completed_at: new Date().toISOString() }
-                            : { completed_at: null }),
-                        }).catch((e) => notify(e.message))
-                      }
-                    >
-                      {statuses.map((s) => (
-                        <option value={s} key={s}>
-                          {statusLabels[s]}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
-                <label>
-                  {document.kind === "project" ? "Area" : "Parent"}
-                  <select
-                    value={
-                      document.kind === "project"
-                        ? (areaFor(document, vault?.documents ?? [])?.id ?? "")
-                        : (document.metadata.parent ?? "")
-                    }
-                    onChange={async (e) => {
-                      const parent = e.target.value || null;
-                      try {
-                        if (await updateMetadata(document.id, { parent })) {
-                          const state = await api.request(
-                            "vault.state",
-                            undefined,
-                          );
-                          if (state) receive(state);
-                          await openDocument(document.id);
-                          setProperties(true);
-                        }
-                      } catch (error: any) {
-                        notify(error.message);
-                      }
-                    }}
-                  >
-                    <option value="" disabled={document.kind === "project"}>
-                      {document.kind === "project"
-                        ? "Choose an area"
-                        : "No parent"}
-                    </option>
-                    {vault?.documents
-                      .filter(
-                        (d) =>
-                          d.id !== document.id &&
-                          (document.kind === "project"
-                            ? d.kind === "area"
-                            : document.kind === "goal"
-                              ? ["area", "goal"].includes(d.kind)
-                              : ["area", "goal", "project", "note"].includes(
-                                  d.kind,
-                                )),
-                      )
-                      .map((d) => (
-                        <option value={d.id} key={d.id}>
-                          {d.title}
-                        </option>
-                      ))}
-                  </select>
-                </label>
-                <label>
-                  Due
-                  <input
-                    type="date"
-                    value={document.metadata.due ?? ""}
-                    onChange={(e) =>
-                      updateMetadata(document.id, {
-                        due: e.target.value || null,
-                      }).catch((e) => notify(e.message))
-                    }
-                  />
-                </label>
-                <code>{document.path}</code>
-                <button
-                  className="text-button"
-                  onClick={() =>
-                    setRename({ id: document.id, path: document.path })
-                  }
-                >
-                  Rename file
-                </button>
-                {document.diagnostics.map((d, i) => (
-                  <p className="form-error" key={i}>
-                    {d}
-                  </p>
-                ))}
-              </div>
-            )}
-            {document.kind === "project" && (
-              <ProjectPages
-                project={document}
-                documents={areaDocuments}
-                onOpen={openDocument}
-                onCreate={() =>
-                  setCreate({
-                    kind: "note",
-                    parent: document.id,
-                    projectId: document.id,
-                  })
                 }
+                size={15}
               />
-            )}
+              <span>
+                {document.kind.charAt(0).toUpperCase() + document.kind.slice(1)}
+              </span>
+              <Icon name="down" size={12} />
+            </button>
+          )}
+        </DocumentToolbar>
+        <div className="document-layout">
+          <DocumentCanvas key={document.id}>
             <MarkdownEditor
               key={current!.id}
               ref={editor}
               document={document}
               missing={!currentDocument}
+              firstPageHeader={
+                <>
+                  {properties && (
+                    <div className="properties-panel">
+                      <label>
+                        Type
+                        <select
+                          value={document.kind}
+                          onChange={(e) =>
+                            updateMetadata(document.id, {
+                              kind: e.target.value,
+                            }).catch((e) => notify(e.message))
+                          }
+                        >
+                          {kinds
+                            .filter((k) => k !== "conversation")
+                            .map((kind) => (
+                              <option key={kind} value={kind}>
+                                {kind === "note" && isProjectPage
+                                  ? "Page"
+                                  : kind.charAt(0).toUpperCase() +
+                                    kind.slice(1)}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      {document.kind === "goal" && (
+                        <label>
+                          Status
+                          <select
+                            value={document.metadata.status}
+                            onChange={(e) =>
+                              updateMetadata(document.id, {
+                                status: e.target.value,
+                                ...(e.target.value === "done"
+                                  ? { completed_at: new Date().toISOString() }
+                                  : { completed_at: null }),
+                              }).catch((e) => notify(e.message))
+                            }
+                          >
+                            {statuses.map((s) => (
+                              <option value={s} key={s}>
+                                {statusLabels[s]}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <label>
+                        {document.kind === "project" ? "Area" : "Parent"}
+                        <select
+                          value={
+                            document.kind === "project"
+                              ? (areaFor(document, vault?.documents ?? [])
+                                  ?.id ?? "")
+                              : (document.metadata.parent ?? "")
+                          }
+                          onChange={async (e) => {
+                            const parent = e.target.value || null;
+                            try {
+                              if (
+                                await updateMetadata(document.id, { parent })
+                              ) {
+                                const state = await api.request(
+                                  "vault.state",
+                                  undefined,
+                                );
+                                if (state) receive(state);
+                                await openDocument(document.id);
+                                setProperties(true);
+                              }
+                            } catch (error: any) {
+                              notify(error.message);
+                            }
+                          }}
+                        >
+                          <option
+                            value=""
+                            disabled={document.kind === "project"}
+                          >
+                            {document.kind === "project"
+                              ? "Choose an area"
+                              : "No parent"}
+                          </option>
+                          {vault?.documents
+                            .filter(
+                              (d) =>
+                                d.id !== document.id &&
+                                (document.kind === "project"
+                                  ? d.kind === "area"
+                                  : document.kind === "goal"
+                                    ? ["area", "goal"].includes(d.kind)
+                                    : [
+                                        "area",
+                                        "goal",
+                                        "project",
+                                        "note",
+                                      ].includes(d.kind)),
+                            )
+                            .map((d) => (
+                              <option value={d.id} key={d.id}>
+                                {d.title}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                      <label>
+                        Due
+                        <input
+                          type="date"
+                          value={document.metadata.due ?? ""}
+                          onChange={(e) =>
+                            updateMetadata(document.id, {
+                              due: e.target.value || null,
+                            }).catch((e) => notify(e.message))
+                          }
+                        />
+                      </label>
+                      <code>{document.path}</code>
+                      <button
+                        className="text-button"
+                        onClick={() =>
+                          setRename({ id: document.id, path: document.path })
+                        }
+                      >
+                        Rename file
+                      </button>
+                      {document.diagnostics.map((d, i) => (
+                        <p className="form-error" key={i}>
+                          {d}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                  {document.kind === "project" && (
+                    <ProjectPages
+                      project={document}
+                      documents={areaDocuments}
+                      onOpen={openDocument}
+                      onCreate={() =>
+                        setCreate({
+                          kind: "note",
+                          parent: document.id,
+                          projectId: document.id,
+                        })
+                      }
+                    />
+                  )}
+                </>
+              }
               source={source}
+              preview={preview}
               onFormattingChange={setFormatting}
               onStatus={setSaveStatus}
               onError={notify}
@@ -999,15 +987,18 @@ export function App() {
                 }
               }}
             />
-          </div>
-          {insertOpen && (
-            <DocumentInsertPanel
-              editor={editor}
-              document={document}
-              documents={areaDocuments}
-              onAttach={attachFile}
-            />
-          )}
+          </DocumentCanvas>
+          <AnimatePresence>
+            {insertOpen && !preview && (
+              <DocumentInsertPanel
+                key="insert-panel"
+                editor={editor}
+                document={document}
+                documents={areaDocuments}
+                onAttach={attachFile}
+              />
+            )}
+          </AnimatePresence>
         </div>
       </section>
     );
@@ -1162,61 +1153,36 @@ export function App() {
             onClick={() => setSidebarHidden(!sidebarHidden)}
           />
         </div>
-        <div className="tab-strip" role="tablist" aria-label="Open pages">
-          {tabs.map((tab) => (
-            <div
-              className={`tab ${active === tab.id ? "active" : ""}`}
-              key={tab.id}
-            >
-              <button
-                role="tab"
-                aria-selected={active === tab.id}
-                onClick={() => navigate(tab)}
-              >
-                {tab.view && (
-                  <Icon
-                    name={
-                      tab.view === "notes" ? "note" : (tab.view as IconName)
-                    }
-                    size={14}
-                  />
-                )}
-                <span>
-                  {tab.documentId
-                    ? (vault.documents.find((d) => d.id === tab.documentId)
-                        ?.title ?? tab.title)
-                    : tab.title}
-                </span>
-              </button>
-              <IconButton
-                icon="close"
-                label={`Close ${tab.title} tab`}
-                size={14}
-                onClick={() => closeTab(tab.id)}
-              />
-            </div>
-          ))}
-          <IconButton
-            icon="add"
-            label="New tab"
-            onClick={() => setPalette(true)}
-          />
-          <div className="titlebar-drag-space" />
-          <IconButton
-            icon="down"
-            label="All open pages"
-            size={13}
-            onClick={() => setPalette(true)}
-          />
-          <IconButton
-            icon="panel"
-            label="Toggle AI assistant (⌘ J)"
-            className={aiOpen ? "mode-selected" : ""}
-            onClick={() => setAiOpen(!aiOpen)}
-          />
-        </div>
+        <PageTabs
+          tabs={tabs.map((tab) => ({
+            id: tab.id,
+            title: tab.documentId
+              ? (vault.documents.find((d) => d.id === tab.documentId)?.title ??
+                tab.title)
+              : tab.title,
+            icon:
+              tab.view && tab.view !== "notes"
+                ? (tab.view as IconName)
+                : "note",
+          }))}
+          active={active}
+          sidebarHidden={sidebarHidden}
+          aiOpen={aiOpen}
+          onSelect={async (id) => {
+            const tab = tabs.find((tab) => tab.id === id);
+            if (tab) await navigate(tab);
+          }}
+          onClose={closeTab}
+          onNew={() => setPalette(true)}
+          onShowSidebar={() => setSidebarHidden(false)}
+          onToggleAI={() => setAiOpen(!aiOpen)}
+          onError={notify}
+        />
       </header>
       <aside className="sidebar" aria-label="Workspace sidebar">
+        <nav className="sidebar-history" aria-label="Page history">
+          {historyControls}
+        </nav>
         <div
           className="sidebar-scroll"
           onScroll={() =>
@@ -1427,7 +1393,6 @@ export function App() {
         <div className="main-workspace">
           {!document && (
             <div className="view-toolbar">
-              {historyControls}
               <span className="toolbar-title">{title}</span>
               {pageOptions}
             </div>

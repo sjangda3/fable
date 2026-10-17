@@ -6,7 +6,16 @@ import {
 } from "@codemirror/state";
 export const external = Annotation.define<boolean>();
 export const frontmatterBoundary = (text: string) =>
-  /^(?:\uFEFF)?---\n(?:[\s\S]*?\n)?---(?:\n|$)/.exec(text)?.[0].length ?? 0;
+  /^(?:\uFEFF)?---\r?\n(?:[\s\S]*?\r?\n)?---(?:\r?\n|$)/.exec(text)?.[0]
+    .length ?? 0;
+
+/** Start on visible content rather than the blank line after hidden properties. */
+export const initialEditorPosition = (raw: string) => {
+  const text = raw.replace(/\r\n/g, "\n");
+  const boundary = frontmatterBoundary(text);
+  const whitespace = /^\s*/.exec(text.slice(boundary))?.[0].length ?? 0;
+  return Math.min(text.length, boundary + whitespace);
+};
 
 /** Select-all in live preview operates on visible content, never hidden properties. */
 export const protectFrontmatter = EditorState.transactionFilter.of(

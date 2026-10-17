@@ -5,7 +5,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { EditorState, StateField, Compartment } from "@codemirror/state";
+import { createPortal } from "react-dom";
+import {
+  EditorState,
+  StateField,
+  Compartment,
+  Transaction,
+} from "@codemirror/state";
 import {
   EditorView,
   Decoration,
@@ -32,14 +38,19 @@ import {
 } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 import {
-  searchKeymap,
+  search,
+  SearchQuery,
+  setSearchQuery,
+  getSearchQuery,
   highlightSelectionMatches,
-  openSearchPanel,
 } from "@codemirror/search";
-import { api } from "./api.ts";
-import type { DocumentSnapshot } from "../../../packages/contracts/index.ts";
 import { imageURL } from "./links.ts";
-import { external, protectFrontmatter } from "./editor-state.ts";
+import {
+  external,
+  protectFrontmatter,
+  initialEditorPosition,
+  frontmatterBoundary,
+} from "./editor-state.ts";
 import {
   blockInsertion,
   editorFormatting,
@@ -47,7 +58,12 @@ import {
   type EditorCommand,
   type EditorFormatting,
 } from "./editor-commands.ts";
-import { documentDropType, FormatButton } from "./DocumentChrome.tsx";
+import {
+  documentDropType,
+  FormatButton,
+  TextStyleMenu,
+} from "./DocumentChrome.tsx";
+import { DocumentPreview } from "./DocumentPreview.tsx";
 
 class MarkerWidget extends WidgetType {
   constructor(
@@ -202,7 +218,13 @@ function decorations(state: EditorState, sourcePath: string) {
     cursor = state.selection.main.head;
   const fm = /^(?:\uFEFF)?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(text);
   if (fm)
-    ranges.push(Decoration.replace({ block: true }).range(0, fm[0].length));
+    ranges.push(
+      // Keep the final newline outside the fold so the first body's line styles apply.
+      Decoration.replace({ block: true, inclusiveEnd: false }).range(
+        0,
+        fm[0].length - (fm[0].endsWith("\n") ? 1 : 0),
+      ),
+    );
   const offset = fm?.[0].length ?? 0;
   const tables: { from: number; to: number }[] = [];
   syntaxTree(state).iterate({
@@ -379,429 +401,415 @@ const highlight = HighlightStyle.define([
   { tag: tags.quote, color: "#838383" },
   { tag: tags.processingInstruction, color: "#a0a0a0" },
 ]);
+const searchHighlights = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    if (
+      !transaction.docChanged &&
+      !transaction.selection &&
+      !transaction.effects.some((effect) => effect.is(setSearchQuery))
+    )
+      return value;
+    const state = transaction.state,
+      query = getSearchQuery(state);
+    if (!query.valid) return Decoration.none;
+    const cursor = query.getCursor(
+      state.doc,
+      frontmatterBoundary(state.doc.toString()),
+    );
+    const ranges = [];
+    for (let result = cursor.next(); !result.done; result = cursor.next()) {
+      const { from, to } = result.value;
+      const selected =
+        state.selection.main.from === from && state.selection.main.to === to;
+      ranges.push(
+        Decoration.mark({
+          class: selected
+            ? "cm-notebook-match is-current"
+            : "cm-notebook-match",
+        }).range(from, to),
+      );
+    }
+    return Decoration.set(ranges);
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
 export interface EditorHandle {
   flush(): Promise<boolean>;
+  getPages(): string[];
   focusTask(line: number): void;
   insert(text: string): void;
   acceptPreservedDraft(): void;
   command(command: EditorCommand): void;
   insertBlock(text: string): void;
+  addPage(): void;
 }
-export const MarkdownEditor = forwardRef<
-  EditorHandle,
+export interface PageEditorHandle {
+  command(command: EditorCommand): void;
+  insert(text: string): void;
+  insertBlock(text: string): void;
+  focusTask(line: number): void;
+  focus(scroll?: boolean): void;
+  reveal(from: number, to: number): void;
+  highlight(query: string, caseSensitive: boolean): void;
+  replace(changes: { from: number; to: number; insert: string }[]): void;
+}
+export const PageEditor = forwardRef<
+  PageEditorHandle,
   {
-    document: DocumentSnapshot;
-    missing?: boolean;
+    raw: string;
+    path: string;
+    title: string;
     source: boolean;
-    onStatus: (status: string) => void;
-    onError: (message: string) => void;
-    onConflictCopy: (raw: string) => void;
-    onFormattingChange?: (formatting: EditorFormatting) => void;
+    preview: boolean;
+    onChange(raw: string): void;
+    onFocus(): void;
+    onFlush(): void;
+    onSearch(): void;
+    onFormattingChange?(formatting: EditorFormatting): void;
+    onError(message: string): void;
   }
->(
-  (
-    {
-      document: doc,
-      missing,
-      source,
-      onStatus,
-      onError,
-      onConflictCopy,
-      onFormattingChange,
-    },
-    ref,
-  ) => {
-    const host = useRef<HTMLDivElement>(null),
-      view = useRef<EditorView | null>(null),
-      compartment = useRef(new Compartment());
-    const base = useRef(doc.revision),
-      saved = useRef(doc.raw),
-      latest = useRef(doc.raw),
-      inflight = useRef<{ raw: string; promise: Promise<boolean> } | null>(
-        null,
-      ),
-      timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined),
-      conflicted = useRef(false);
-    const [conflict, setConflict] = useState(false);
-    const [bubble, setBubble] = useState<{
-      left: number;
-      top: number;
-      below: boolean;
-      format: EditorFormatting;
-    } | null>(null);
-    const sourceRef = useRef(source);
-    sourceRef.current = source;
-    const formattingCallback = useRef(onFormattingChange);
-    const selectionFrame = useRef<number | undefined>(undefined);
-    formattingCallback.current = onFormattingChange;
-    const reportSelection = (v: EditorView) => {
-      if (selectionFrame.current !== undefined)
-        cancelAnimationFrame(selectionFrame.current);
-      const format = editorFormatting(v.state);
-      formattingCallback.current?.(format);
-      const range = v.state.selection.main;
-      if (range.empty || sourceRef.current) {
-        setBubble(null);
-        return;
-      }
-      selectionFrame.current = requestAnimationFrame(() => {
-        if (view.current !== v) return;
-        const start = v.coordsAtPos(range.from),
-          end = v.coordsAtPos(range.to);
-        const canvas = host.current
-          ?.closest(".document-canvas")
-          ?.getBoundingClientRect();
-        if (
-          !start ||
-          !end ||
-          !canvas ||
-          end.bottom < canvas.top ||
-          start.top > canvas.bottom
-        ) {
-          setBubble(null);
-          return;
-        }
-        const below = start.top < canvas.top + 48;
-        setBubble({
-          left: Math.max(
-            canvas.left + 160,
-            Math.min(canvas.right - 160, (start.left + end.right) / 2),
-          ),
-          top: below
-            ? Math.min(
-                canvas.bottom - 48,
-                Math.max(canvas.top + 8, end.bottom + 8),
-              )
-            : start.top - 8,
-          below,
-          format,
-        });
-      });
-    };
-    const run = (command: EditorCommand) => {
-      const v = view.current;
-      if (!v) return;
-      if (command === "undo") undo(v);
-      else if (command === "redo") redo(v);
-      else if (command === "indent") indentMore(v);
-      else if (command === "outdent") indentLess(v);
-      else if (command === "search") {
-        setBubble(null);
-        openSearchPanel(v);
-        return;
-      } else {
-        const transaction = formattingTransaction(v.state, command);
-        if (transaction) v.dispatch({ ...transaction, scrollIntoView: true });
-      }
-      v.focus();
-      reportSelection(v);
-    };
-    const callbacks = useRef({ onStatus, onError });
-    callbacks.current = { onStatus, onError };
-    const persist = async (): Promise<boolean> => {
-      clearTimeout(timer.current);
-      if (conflicted.current) return false;
-      if (inflight.current) {
-        if (!(await inflight.current.promise) || conflicted.current)
-          return false;
-        return latest.current !== saved.current ? persist() : true;
-      }
-      if (latest.current === saved.current) return true;
-      const raw = latest.current;
-      callbacks.current.onStatus("Saving…");
-      const promise = (async () => {
-        try {
-          const result = await api.request("documents.save", {
-            id: doc.id,
-            baseRevision: base.current,
-            raw,
-          });
-          base.current = result.revision;
-          saved.current = raw;
-          callbacks.current.onStatus(
-            latest.current === raw ? "Saved" : "Unsaved changes",
-          );
-          return true;
-        } catch (e: any) {
-          callbacks.current.onStatus("Unsaved changes");
-          if (e.code === "STALE_REVISION") {
-            conflicted.current = true;
-            setConflict(true);
-          }
-          callbacks.current.onError(e.message);
-          return false;
-        } finally {
-          inflight.current = null;
-        }
-      })();
-      inflight.current = { raw, promise };
-      return promise;
-    };
-    const persistRef = useRef(persist);
-    persistRef.current = persist;
-    useImperativeHandle(ref, () => ({
-      flush: () => persistRef.current(),
-      acceptPreservedDraft() {
-        saved.current = latest.current;
-        conflicted.current = false;
-        setConflict(false);
-      },
-      command: run,
-      insertBlock(text) {
-        const v = view.current;
-        if (v) {
-          v.dispatch(blockInsertion(v.state, text));
-          v.focus();
-        }
-      },
-      focusTask(line) {
-        const v = view.current;
-        if (v) {
-          const target = v.state.doc.line(Math.min(line, v.state.doc.lines));
-          v.dispatch({
-            selection: { anchor: target.from },
-            effects: EditorView.scrollIntoView(target.from, { y: "center" }),
-          });
-          v.focus();
-        }
-      },
-      insert(text) {
-        const v = view.current;
-        if (v) {
-          v.dispatch(v.state.replaceSelection(text));
-          v.focus();
-        }
-      },
-    }));
-    useEffect(() => {
-      const fm = /^(?:\uFEFF)?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(
-        doc.raw,
-      );
-      const editor = new EditorView({
-        parent: host.current!,
-        state: EditorState.create({
-          doc: doc.raw,
-          selection: { anchor: fm?.[0].replace(/\r\n/g, "\n").length ?? 0 },
-          extensions: [
-            EditorState.lineSeparator.of(
-              doc.raw.includes("\r\n") ? "\r\n" : "\n",
-            ),
-            history(),
-            drawSelection(),
-            markdown({ base: markdownLanguage }),
-            syntaxHighlighting(highlight),
-            highlightSelectionMatches(),
-            EditorView.lineWrapping,
-            keymap.of([
-              {
-                key: "Mod-b",
-                run: () => {
-                  run("bold");
-                  return true;
-                },
-              },
-              {
-                key: "Mod-i",
-                run: () => {
-                  run("italic");
-                  return true;
-                },
-              },
-              ...defaultKeymap,
-              ...historyKeymap,
-              ...searchKeymap,
-              indentWithTab,
-            ]),
-            EditorView.contentAttributes.of({
-              "aria-label": `Edit ${doc.title}`,
-              spellcheck: "true",
-            }),
-            compartment.current.of(
-              source ? [] : [livePreview(doc.path), protectFrontmatter],
-            ),
-            EditorView.updateListener.of((update) => {
-              if (update.selectionSet || update.docChanged)
-                reportSelection(update.view);
-              if (
-                update.docChanged &&
-                !update.transactions.some((t) => t.annotation(external))
-              ) {
-                latest.current = update.state.sliceDoc();
-                callbacks.current.onStatus("Unsaved changes");
-                clearTimeout(timer.current);
-                timer.current = setTimeout(() => {
-                  void persistRef.current();
-                }, 300);
-              }
-            }),
-            EditorView.theme({
-              ".cm-scroller": {
-                fontFamily: "var(--fable-editor-font, inherit)",
-              },
-            }),
-            EditorView.domEventHandlers({
-              drop: (event, v) => {
-                const text = event.dataTransfer?.getData(documentDropType);
-                if (!text) return false;
-                event.preventDefault();
-                v.dispatch(
-                  blockInsertion(
-                    v.state,
-                    text,
-                    v.posAtCoords({ x: event.clientX, y: event.clientY }) ??
-                      undefined,
-                  ),
-                );
-                v.focus();
-                return true;
-              },
-              dragover: (event) => {
-                if (event.dataTransfer?.types.includes(documentDropType)) {
-                  event.preventDefault();
-                  event.dataTransfer.dropEffect = "copy";
-                  return true;
-                }
-                return false;
-              },
-              blur: () => {
-                void persistRef.current();
-              },
-            }),
-          ],
-        }),
-      });
-      view.current = editor;
-      reportSelection(editor);
-      const hideBubble = () => setBubble(null);
-      const dismissOutside = (event: Event) => {
-        const target = event.target;
-        if (
-          target instanceof Element &&
-          (host.current?.contains(target) ||
-            target.closest(".selection-toolbar"))
-        )
-          return;
-        hideBubble();
-      };
-      window.document.addEventListener("pointerdown", dismissOutside);
-      const canvas = host.current?.closest(".document-canvas");
-      const repositionBubble = () => {
-        if (
-          editor.hasFocus ||
-          window.document.activeElement?.closest(".selection-toolbar")
-        )
-          reportSelection(editor);
-        else hideBubble();
-      };
-      canvas?.addEventListener("scroll", repositionBubble, { passive: true });
-      window.addEventListener("resize", repositionBubble);
-      const interval = setInterval(() => {
-        if (latest.current !== saved.current) void persistRef.current();
-      }, 1500);
-      const prevent = (event: BeforeUnloadEvent) => {
-        if (latest.current !== saved.current) {
-          event.preventDefault();
-          event.returnValue = "";
-          void persistRef.current();
-        }
-      };
-      window.addEventListener("beforeunload", prevent);
-      return () => {
-        clearInterval(interval);
-        clearTimeout(timer.current);
-        if (selectionFrame.current !== undefined)
-          cancelAnimationFrame(selectionFrame.current);
-        window.removeEventListener("beforeunload", prevent);
-        canvas?.removeEventListener("scroll", repositionBubble);
-        window.removeEventListener("resize", repositionBubble);
-        window.document.removeEventListener("pointerdown", dismissOutside);
-        editor.destroy();
-        view.current = null;
-      };
-    }, []);
-    useEffect(() => {
+>(function PageEditor(
+  {
+    raw,
+    path,
+    title,
+    source,
+    preview,
+    onChange,
+    onFocus,
+    onFlush,
+    onSearch,
+    onFormattingChange,
+    onError,
+  },
+  ref,
+) {
+  const host = useRef<HTMLDivElement>(null),
+    view = useRef<EditorView | null>(null),
+    compartment = useRef(new Compartment()),
+    editability = useRef(new Compartment());
+  const callbacks = useRef({ onChange, onFocus, onFlush, onSearch });
+  callbacks.current = { onChange, onFocus, onFlush, onSearch };
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
+  const [bubble, setBubble] = useState<{
+    left: number;
+    top: number;
+    below: boolean;
+    format: EditorFormatting;
+  } | null>(null);
+  const sourceRef = useRef(source);
+  sourceRef.current = source;
+  const formattingCallback = useRef(onFormattingChange);
+  const selectionFrame = useRef<number | undefined>(undefined);
+  formattingCallback.current = onFormattingChange;
+  const reportSelection = (v: EditorView) => {
+    if (selectionFrame.current !== undefined)
+      cancelAnimationFrame(selectionFrame.current);
+    const format = editorFormatting(v.state);
+    formattingCallback.current?.(format);
+    const range = v.state.selection.main;
+    if (range.empty || sourceRef.current || previewRef.current || !v.hasFocus) {
       setBubble(null);
+      return;
+    }
+    selectionFrame.current = requestAnimationFrame(() => {
+      if (view.current !== v) return;
+      const start = v.coordsAtPos(range.from),
+        end = v.coordsAtPos(range.to);
+      const canvas = host.current
+        ?.closest(".document-canvas")
+        ?.getBoundingClientRect();
+      if (
+        !start ||
+        !end ||
+        !canvas ||
+        end.bottom < canvas.top ||
+        start.top > canvas.bottom
+      ) {
+        setBubble(null);
+        return;
+      }
+      const below = start.top < canvas.top + 48;
+      setBubble({
+        left: Math.max(
+          canvas.left + 160,
+          Math.min(canvas.right - 160, (start.left + end.right) / 2),
+        ),
+        top: below
+          ? Math.min(
+              canvas.bottom - 48,
+              Math.max(canvas.top + 8, end.bottom + 8),
+            )
+          : start.top - 8,
+        below,
+        format,
+      });
+    });
+  };
+  const run = (command: EditorCommand) => {
+    const v = view.current;
+    if (!v || previewRef.current) return;
+    if (command === "undo") undo(v);
+    else if (command === "redo") redo(v);
+    else if (command === "indent") indentMore(v);
+    else if (command === "outdent") indentLess(v);
+    else if (command === "search") {
+      setBubble(null);
+      callbacks.current.onSearch();
+      return;
+    } else {
+      const transaction = formattingTransaction(v.state, command);
+      if (transaction) v.dispatch({ ...transaction, scrollIntoView: true });
+    }
+    v.focus();
+    reportSelection(v);
+  };
+  useImperativeHandle(ref, () => ({
+    command: run,
+    focus(scroll = false) {
+      view.current?.focus();
+      if (scroll && view.current)
+        view.current.dispatch({
+          effects: EditorView.scrollIntoView(
+            view.current.state.selection.main.head,
+            { y: "start", yMargin: 120 },
+          ),
+        });
+    },
+    reveal(from, to) {
       view.current?.dispatch({
-        effects: compartment.current.reconfigure(
-          source ? [] : [livePreview(doc.path), protectFrontmatter],
+        selection: { anchor: from, head: to },
+        effects: EditorView.scrollIntoView(from, { y: "center" }),
+      });
+    },
+    highlight(query, caseSensitive) {
+      view.current?.dispatch({
+        effects: setSearchQuery.of(
+          new SearchQuery({
+            search: query,
+            caseSensitive,
+            literal: true,
+            test: (_match, state, from) =>
+              from >= frontmatterBoundary(state.doc.toString()),
+          }),
         ),
       });
-    }, [source, doc.path]);
-    useEffect(() => {
-      view.current?.contentDOM.setAttribute("aria-label", `Edit ${doc.title}`);
-    }, [doc.title]);
-    useEffect(() => {
-      if (missing) {
-        conflicted.current = true;
-        setConflict(true);
-        callbacks.current.onStatus("The file moved or was removed");
-      }
-    }, [missing]);
-    useEffect(() => {
-      if (doc.revision === base.current) return;
-      if (inflight.current?.raw === doc.raw) {
-        base.current = doc.revision;
-        return;
-      }
-      if (latest.current !== saved.current) {
-        conflicted.current = true;
-        setConflict(true);
-        callbacks.current.onStatus("External changes need review");
-        return;
-      }
-      base.current = doc.revision;
-      saved.current = doc.raw;
-      latest.current = doc.raw;
+    },
+    replace(changes) {
+      view.current?.dispatch({ changes, userEvent: "input.replace" });
+    },
+    insertBlock(text) {
       const v = view.current;
-      if (v)
+      if (v && !previewRef.current) {
+        v.dispatch(blockInsertion(v.state, text));
+        v.focus();
+      }
+    },
+    focusTask(line) {
+      const v = view.current;
+      if (v) {
+        const target = v.state.doc.line(Math.min(line, v.state.doc.lines));
         v.dispatch({
-          changes: { from: 0, to: v.state.doc.length, insert: doc.raw },
-          selection: {
-            anchor: Math.min(v.state.selection.main.head, doc.raw.length),
-          },
-          annotations: external.of(true),
+          selection: { anchor: target.from },
+          effects: EditorView.scrollIntoView(target.from, { y: "center" }),
         });
-    }, [doc.revision]);
-    return (
-      <>
-        {conflict && (
-          <div className="editor-conflict" role="status">
-            <span>
-              {missing
-                ? "This file moved or was removed."
-                : "This file changed elsewhere."}{" "}
-              Your draft is safe in the editor.
-            </span>
-            <button onClick={() => onConflictCopy(latest.current)}>
-              Keep draft as a copy
-            </button>
-            <button
-              disabled={missing}
-              onClick={() => {
-                conflicted.current = false;
-                setConflict(false);
-                base.current = doc.revision;
-                saved.current = doc.raw;
-                latest.current = doc.raw;
-                view.current?.dispatch({
-                  changes: {
-                    from: 0,
-                    to: view.current.state.doc.length,
-                    insert: doc.raw,
-                  },
-                  annotations: external.of(true),
-                });
-              }}
-            >
-              Use file version
-            </button>
-          </div>
-        )}
-        <div
-          className={`markdown-editor ${source ? "source-mode" : ""}`}
-          ref={host}
-        />
-        {bubble && (
+        v.focus();
+      }
+    },
+    insert(text) {
+      const v = view.current;
+      if (v && !previewRef.current) {
+        v.dispatch(v.state.replaceSelection(text));
+        v.focus();
+      }
+    },
+  }));
+  useEffect(() => {
+    const editor = new EditorView({
+      parent: host.current!,
+      state: EditorState.create({
+        doc: raw,
+        selection: { anchor: initialEditorPosition(raw) },
+        extensions: [
+          EditorState.lineSeparator.of(raw.includes("\r\n") ? "\r\n" : "\n"),
+          history(),
+          editability.current.of([
+            EditorView.editable.of(!preview),
+            EditorState.readOnly.of(preview),
+          ]),
+          drawSelection(),
+          markdown({ base: markdownLanguage }),
+          syntaxHighlighting(highlight),
+          highlightSelectionMatches(),
+          search(),
+          searchHighlights,
+          EditorView.lineWrapping,
+          keymap.of([
+            {
+              key: "Mod-b",
+              run: () => {
+                run("bold");
+                return true;
+              },
+            },
+            {
+              key: "Mod-i",
+              run: () => {
+                run("italic");
+                return true;
+              },
+            },
+            ...defaultKeymap,
+            ...historyKeymap,
+            {
+              key: "Mod-f",
+              run: () => {
+                callbacks.current.onSearch();
+                return true;
+              },
+            },
+            indentWithTab,
+          ]),
+          EditorView.contentAttributes.of({
+            "aria-label": `Edit ${title}`,
+            spellcheck: "true",
+          }),
+          compartment.current.of(
+            source ? [] : [livePreview(path), protectFrontmatter],
+          ),
+          EditorView.updateListener.of((update) => {
+            if (update.selectionSet || update.docChanged)
+              reportSelection(update.view);
+            if (
+              update.docChanged &&
+              !update.transactions.some((t) => t.annotation(external))
+            ) {
+              callbacks.current.onChange(update.state.sliceDoc());
+            }
+          }),
+          EditorView.theme({
+            ".cm-scroller": {
+              fontFamily: "var(--fable-editor-font, inherit)",
+            },
+          }),
+          EditorView.domEventHandlers({
+            drop: (event, v) => {
+              const text = event.dataTransfer?.getData(documentDropType);
+              if (!text) return false;
+              event.preventDefault();
+              v.dispatch(
+                blockInsertion(
+                  v.state,
+                  text,
+                  v.posAtCoords({ x: event.clientX, y: event.clientY }) ??
+                    undefined,
+                ),
+              );
+              v.focus();
+              return true;
+            },
+            dragover: (event) => {
+              if (event.dataTransfer?.types.includes(documentDropType)) {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "copy";
+                return true;
+              }
+              return false;
+            },
+            focus: () => {
+              callbacks.current.onFocus();
+              reportSelection(view.current!);
+            },
+            blur: () => {
+              callbacks.current.onFlush();
+            },
+          }),
+        ],
+      }),
+    });
+    view.current = editor;
+    reportSelection(editor);
+    const hideBubble = () => setBubble(null);
+    const dismissOutside = (event: Event) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        (host.current?.contains(target) ||
+          target.closest(".selection-toolbar, .dropdown-root"))
+      )
+        return;
+      hideBubble();
+    };
+    window.document.addEventListener("pointerdown", dismissOutside);
+    const canvas = host.current?.closest(".document-canvas");
+    const repositionBubble = () => {
+      if (
+        editor.hasFocus ||
+        window.document.activeElement?.closest(".selection-toolbar")
+      )
+        reportSelection(editor);
+      else hideBubble();
+    };
+    canvas?.addEventListener("scroll", repositionBubble, { passive: true });
+    window.addEventListener("resize", repositionBubble);
+    return () => {
+      if (selectionFrame.current !== undefined)
+        cancelAnimationFrame(selectionFrame.current);
+      canvas?.removeEventListener("scroll", repositionBubble);
+      window.removeEventListener("resize", repositionBubble);
+      window.document.removeEventListener("pointerdown", dismissOutside);
+      editor.destroy();
+      view.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    setBubble(null);
+    view.current?.dispatch({
+      effects: compartment.current.reconfigure(
+        source ? [] : [livePreview(path), protectFrontmatter],
+      ),
+    });
+  }, [source, path]);
+  useEffect(() => {
+    setBubble(null);
+    const editor = view.current;
+    editor?.dispatch({
+      effects: editability.current.reconfigure([
+        EditorView.editable.of(!preview),
+        EditorState.readOnly.of(preview),
+      ]),
+    });
+    if (!preview) editor?.requestMeasure();
+  }, [preview]);
+  useEffect(() => {
+    view.current?.contentDOM.setAttribute("aria-label", `Edit ${title}`);
+  }, [title]);
+  useEffect(() => {
+    const editor = view.current;
+    if (!editor || editor.state.sliceDoc() === raw) return;
+    editor.dispatch({
+      changes: { from: 0, to: editor.state.doc.length, insert: raw },
+      selection: {
+        anchor: Math.min(
+          editor.state.selection.main.head,
+          raw.replace(/\r\n/g, "\n").length,
+        ),
+      },
+      annotations: [external.of(true), Transaction.addToHistory.of(false)],
+    });
+  }, [raw]);
+  return (
+    <>
+      {preview && <DocumentPreview raw={raw} path={path} title={title} />}
+      <div
+        hidden={preview}
+        className={`markdown-editor ${source ? "source-mode" : ""}`}
+        ref={host}
+      />
+      {bubble &&
+        createPortal(
           <div
             className={`selection-toolbar ${bubble.below ? "is-below" : ""}`}
             role="toolbar"
@@ -809,18 +817,12 @@ export const MarkdownEditor = forwardRef<
             style={{ left: bubble.left, top: bubble.top }}
             onMouseDown={(e) => e.preventDefault()}
           >
-            <select
-              className="selection-style"
-              aria-label="Selection text style"
-              value={bubble.format.block}
-              onMouseDown={(event) => event.stopPropagation()}
-              onChange={(event) => run(event.target.value as EditorCommand)}
-            >
-              <option value="paragraph">Text</option>
-              <option value="heading1">Title</option>
-              <option value="heading2">H1</option>
-              <option value="heading3">H2</option>
-            </select>
+            <TextStyleMenu
+              label="Selection text style"
+              block={bubble.format.block}
+              run={run}
+              onError={onError}
+            />
             <FormatButton
               command="bold"
               label="Bold selection"
@@ -853,9 +855,9 @@ export const MarkdownEditor = forwardRef<
               label="Make selection a task"
               run={run}
             />
-          </div>
+          </div>,
+          window.document.body,
         )}
-      </>
-    );
-  },
-);
+    </>
+  );
+});

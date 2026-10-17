@@ -103,4 +103,48 @@ describe("document toolbar commands", () => {
       header + table + "\n\n> A quote\n\nFollowing paragraph",
     );
   });
+  it("keeps the same heading when its checked menu item is selected again", () => {
+    const state = make("## Keep this heading", 7);
+    expect(apply(state, "heading2").doc.toString()).toBe(state.doc.toString());
+    expect(apply(state, "heading2").selection.main.head).toBe(
+      state.selection.main.head,
+    );
+    expect(
+      state.update(formattingTransaction(state, "heading2")!).docChanged,
+    ).toBe(false);
+  });
+  it("formats the current word instead of inserting placeholder text at the cursor", () => {
+    const state = apply(make("A useful editor", 5), "bold");
+    expect(state.doc.toString()).toBe(header + "A **useful** editor");
+  });
+  it.each([
+    ["bold", "**"],
+    ["italic", "*"],
+    ["strike", "~~"],
+    ["code", "`"],
+  ] as const)(
+    "removes %s around the cursor without inserting new text",
+    (command, mark) => {
+      const state = apply(
+        make(`${mark}useful${mark}`, mark.length + 3),
+        command,
+      );
+      expect(state.doc.toString()).toBe(header + "useful");
+      expect(state.selection.main.head).toBe(header.length + 3);
+    },
+  );
+  it("preserves a backwards selection when changing its heading level", () => {
+    const state = make("Some selected text", 15, 2);
+    const result = apply(state, "heading3");
+    expect(result.doc.toString()).toBe(header + "### Some selected text");
+    expect(result.selection.main.anchor).toBe(header.length + 19);
+    expect(result.selection.main.head).toBe(header.length + 6);
+  });
+  it.each([
+    ["- List", "bulletList"],
+    ["1. List", "numberedList"],
+    ["- [ ] Task", "taskList"],
+  ] as const)("reports the active list for %s", (body, kind) => {
+    expect(editorFormatting(make(body, body.length)).list).toBe(kind);
+  });
 });

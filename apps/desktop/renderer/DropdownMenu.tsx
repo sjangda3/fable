@@ -52,6 +52,7 @@ export function DropdownMenu({
   returnFocus,
   onClose,
   onError,
+  showIcons = true,
 }: {
   label: string;
   items: DropdownEntry[];
@@ -59,6 +60,7 @@ export function DropdownMenu({
   returnFocus: HTMLElement | null;
   onClose: () => void;
   onError: (message: string) => void;
+  showIcons?: boolean;
 }) {
   const id = useId(),
     reduced = useReducedMotion(),
@@ -313,12 +315,12 @@ export function DropdownMenu({
             }
           }}
         >
-          <Icon name={item.icon} size={16} />
+          {showIcons && <Icon name={item.icon} size={16} />}
           <span>{item.label}</span>
-          {item.checked && (
+          {showIcons && item.checked && (
             <Icon name="check" size={16} className="dropdown-trailing" />
           )}
-          {item.children && (
+          {showIcons && item.children && (
             <Icon name="right" size={16} className="dropdown-trailing" />
           )}
         </button>
@@ -339,7 +341,7 @@ export function DropdownMenu({
         ref={panel}
         role="menu"
         aria-label={label}
-        className="dropdown-menu"
+        className={`dropdown-menu ${showIcons ? "" : "is-text-only"}`}
         style={{ ...position, width: anchor.width ?? 176 }}
         initial={{ y: reduced ? 0 : -4, scale: reduced ? 1 : 0.98 }}
         animate={{ y: 0, scale: 1 }}

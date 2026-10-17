@@ -54,11 +54,14 @@ import {
   LeftToRightListBulletIcon,
   LeftToRightListNumberIcon,
   Link01Icon,
-  Table01Icon,
+  GridTableIcon,
   TextQuoteIcon,
   Image01Icon,
   TextIndentIcon,
   MinusSignIcon,
+  Cursor01Icon,
+  HandGrabIcon,
+  Download01Icon,
 } from "@hugeicons/core-free-icons";
 const icons = {
   areas: Layers01Icon,
@@ -118,11 +121,15 @@ const icons = {
   bulletList: LeftToRightListBulletIcon,
   numberedList: LeftToRightListNumberIcon,
   link: Link01Icon,
-  table: Table01Icon,
+  table: GridTableIcon,
   quote: TextQuoteIcon,
   image: Image01Icon,
   indent: TextIndentIcon,
   divider: MinusSignIcon,
+  cursor: Cursor01Icon,
+  hand: HandGrabIcon,
+  download: Download01Icon,
+  centerPage: Target03Icon,
 };
 const library = {
   ...icons,

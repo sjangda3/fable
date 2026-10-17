@@ -140,6 +140,14 @@ function localPreview(): Plugin {
 }
 export default defineConfig({
   plugins: [react(), localPreview()],
+  optimizeDeps: {
+    include: [
+      "@react-pdf/renderer",
+      "@react-pdf/layout",
+      "@react-pdf/font",
+      "pdfkit",
+    ],
+  },
   server: {
     host: "127.0.0.1",
     port: 5173,

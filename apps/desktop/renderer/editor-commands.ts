@@ -1,3 +1,5 @@
+export type EditorMode = "live" | "preview" | "code";
+
 import {
   EditorSelection,
   type EditorState,
@@ -34,6 +36,7 @@ export interface EditorFormatting {
   strike: boolean;
   code: boolean;
   block: string;
+  list: "bulletList" | "numberedList" | "taskList" | null;
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -43,6 +46,7 @@ export const emptyFormatting: EditorFormatting = {
   strike: false,
   code: false,
   block: "paragraph",
+  list: null,
   canUndo: false,
   canRedo: false,
 };
@@ -67,6 +71,13 @@ export function editorFormatting(state: EditorState): EditorFormatting {
     strike: names.includes("Strikethrough"),
     code: names.includes("InlineCode"),
     block: heading ? `heading${heading[1].length}` : "paragraph",
+    list: /^\s*(?:[-+*]|\d+[.)])\s+\[[ xX]\]/.test(line)
+      ? "taskList"
+      : /^\s*[-+*]\s+/.test(line)
+        ? "bulletList"
+        : /^\s*\d+[.)]\s+/.test(line)
+          ? "numberedList"
+          : null,
     canUndo: undoDepth(state) > 0,
     canRedo: redoDepth(state) > 0,
   };
@@ -79,9 +90,8 @@ export function formattingTransaction(
 ): TransactionSpec | undefined {
   const boundary = frontmatterBoundary(state.doc.toString());
   const range = state.selection.main;
-  const from = Math.max(boundary, range.from),
+  let from = Math.max(boundary, range.from),
     to = Math.max(from, range.to);
-  const selected = state.sliceDoc(from, to);
   const mark = (
     { bold: "**", italic: "*", strike: "~~", code: "`" } as Record<
       string,
@@ -89,6 +99,55 @@ export function formattingTransaction(
     >
   )[command];
   if (mark) {
+    if (range.empty) {
+      const target = {
+        bold: "StrongEmphasis",
+        italic: "Emphasis",
+        strike: "Strikethrough",
+        code: "InlineCode",
+      }[command as "bold" | "italic" | "strike" | "code"];
+      let enclosing: { from: number; to: number } | undefined;
+      for (
+        let node = syntaxTree(state).resolveInner(from, -1);
+        node;
+        node = node.parent!
+      ) {
+        if (node.name === target) {
+          enclosing = node;
+          break;
+        }
+      }
+      if (enclosing) {
+        return {
+          changes: [
+            {
+              from: enclosing.from,
+              to: enclosing.from + mark.length,
+              insert: "",
+            },
+            { from: enclosing.to - mark.length, to: enclosing.to, insert: "" },
+          ],
+          selection: EditorSelection.cursor(
+            Math.max(
+              enclosing.from,
+              Math.min(from - mark.length, enclosing.to - 2 * mark.length),
+            ),
+          ),
+          userEvent: "input.format",
+        };
+      }
+      const line = state.doc.lineAt(from);
+      for (const word of line.text.matchAll(/[\p{L}\p{N}_]+/gu)) {
+        const start = line.from + word.index!,
+          end = start + word[0].length;
+        if (start <= from && from <= end) {
+          from = start;
+          to = end;
+          break;
+        }
+      }
+    }
+    const selected = state.sliceDoc(from, to);
     const before = state.sliceDoc(Math.max(boundary, from - mark.length), from);
     const after = state.sliceDoc(to, to + mark.length);
     if (before === mark && after === mark) {
@@ -135,6 +194,7 @@ export function formattingTransaction(
       userEvent: "input.format",
     };
   }
+  const selected = state.sliceDoc(from, to);
   if (command === "link") {
     const label = selected || "Link text";
     const insert = `[${label}](https://)`;
@@ -191,8 +251,13 @@ export function formattingTransaction(
             } as Record<string, string>
           )[command];
     const existing = /^(?:#{1,6}\s+|>\s?|[-+*]\s+(?:\[[ xX]\]\s*)?|\d+[.)]\s+)/;
+    if (
+      command.startsWith("heading") &&
+      lines.every((line, i) => line.text.startsWith(prefix(i)))
+    )
+      return {};
     const toggled =
-      command !== "paragraph" &&
+      !["paragraph", "heading1", "heading2", "heading3"].includes(command) &&
       lines.every((line, i) =>
         command === "bulletList"
           ? /^[-+*]\s+(?!\[[ xX]\])/.test(line.text)
@@ -212,8 +277,8 @@ export function formattingTransaction(
     return {
       changes,
       selection: EditorSelection.range(
-        changes.mapPos(from, 1),
-        changes.mapPos(to, 1),
+        changes.mapPos(Math.max(boundary, range.anchor), 1),
+        changes.mapPos(Math.max(boundary, range.head), 1),
       ),
       userEvent: "input.format",
     };

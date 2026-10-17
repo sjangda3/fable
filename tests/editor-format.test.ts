@@ -4,7 +4,11 @@ import {
   resolveVaultLink,
   relativeVaultHref,
 } from "../apps/desktop/renderer/links.ts";
-import { protectFrontmatter } from "../apps/desktop/renderer/editor-state.ts";
+import {
+  protectFrontmatter,
+  initialEditorPosition,
+  frontmatterBoundary,
+} from "../apps/desktop/renderer/editor-state.ts";
 describe("editor file boundaries", () => {
   it("creates valid attachment links for root and deeply nested notes", () => {
     for (const source of ["Root.md", "Notes/A.md", "Notes/Deep/Nested.md"]) {
@@ -63,5 +67,16 @@ describe("editor file boundaries", () => {
     ).toBe("Notes/Café.md");
     expect(resolveVaultLink("Notes/A.md", "../../private.md")).toBeUndefined();
     expect(resolveVaultLink("A.md", "https://example.com")).toBeUndefined();
+  });
+  it("starts formatting on the first visible content line", () => {
+    const raw = "---\nfable:\n  id: stable\n---\n\n\n# Title";
+    expect(initialEditorPosition(raw)).toBe(raw.indexOf("# Title"));
+  });
+  it("finds the visible body in CRLF files and normalizes the initial cursor offset", () => {
+    const raw = "---\r\nfable:\r\n  id: stable\r\n---\r\n\r\nBody";
+    expect(raw.slice(frontmatterBoundary(raw))).toBe("\r\nBody");
+    expect(initialEditorPosition(raw)).toBe(
+      raw.replaceAll("\r\n", "\n").indexOf("Body"),
+    );
   });
 });

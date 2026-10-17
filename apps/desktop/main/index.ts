@@ -54,6 +54,7 @@ const mime: Record<string, string> = {
   ".gif": "image/gif",
   ".ico": "image/x-icon",
   ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
 };
 async function openExternal(value: string) {
   const url = new URL(value);
@@ -215,6 +216,7 @@ app
         return new Response(await fs.readFile(file), {
           headers: {
             "Content-Type": mime[path.extname(file).toLowerCase()],
+            "Access-Control-Allow-Origin": "fable://app",
             "Content-Security-Policy": "default-src 'none'; sandbox",
           },
         });
